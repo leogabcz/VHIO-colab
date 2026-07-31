@@ -1,0 +1,559 @@
+---
+title: "Identifying non-neutral TCRb clonotypes in longitudinal PBL samples"
+author: "Endika Prieto-Fernández"
+date: "2025-04-01"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+**Description:**
+
+A pipeline for filtering out non-neutral TCRb clonotype trajectories in the blood of ICB-treated patients is based on removing the natural variability of the TCR repertoire characterized in healthy individuals, and includes additional filters to remove background noise caused by technological bias. Once non-neutral clonotypes have been identified, distance matrix-based k means clustering groups the trajectories into distinct waves of expansion or contraction.
+
+# lib
+
+```{r, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(edgeR)
+library(factoextra)
+library(ggplot2)
+library(ggrepel)
+library(grid)
+library(httr)
+library(patchwork)
+library(purrr)
+library(RColorBrewer)
+library(readxl)
+library(scales)
+library(stringr)
+library(tidyverse)
+library(zoo)
+
+```
+
+# fun
+
+local
+
+```{r}
+source("/Users/endikaprieto/Library/CloudStorage/OneDrive-VHIO/pbl/bulk/tools/ibilbide/v6/auxiliary_functions_v6.R")
+```
+
+# var
+
+load hd
+
+```{r, warning=F}
+
+#hd <- c("HD106_SEQTR", "HD197_SEQTR")                                                  # Gros et al. SEQTR
+#hd <- c("HD106", "HD159", "HD196", "HD197", "HD199")                                   # Gros et al. adaptive.
+#hd <- c("HD106_hsd", "HD159_hsd", "HD196_hsd", "HD197_hsd", "HD199_hsd")               # Gros et al. hsd.
+#hd <- c("CHU01", "CHU02", "CHU03")                                                     # Chu et al. adaptive.
+#hd <- c(paste0("MIT0", c(1:9)), paste0("MIT", c(10:25)))                               # Mitchell et al. adaptive.
+#hd <- c("YOSD1_CD4", "YOSD2_CD4", "YOSD3_CD4", "YOSD4_CD4", "YOSD5_CD4", "YOSD6_CD4")  # Yoshida et al. cd4. adaptive.
+#hd <- c("YOSD1_CD8", "YOSD2_CD8", "YOSD3_CD8", "YOSD4_CD8", "YOSD5_CD8", "YOSD6_CD8")  # Yoshida et al. cd8. adaptive.
+#hd <- c("HD106_SEQTR", "HD197_SEQTR"
+#        , "HDBR01_SEQTR", "HDBR02_SEQTR", "HDBR03_SEQTR", "HDBR06_SEQTR"
+#        , "HD106bis_SEQTR_1e6", "HD197bis_SEQTR_1e6")                                   # SEQTR cohort, RNA-based.
+hd <- c("HD106_SEQTR",
+        "HD197_SEQTR",
+        "HDBR01_SEQTR_ReSeq",
+        "HDBR02_SEQTR_ReSeq",
+        "HDBR03_SEQTR_ReSeq",
+        "HDBR06_SEQTR_ReSeq")
+
+load_data(samples = hd,
+          datapath.pbl = "/Volumes/datos_lab/tcrb/data_blood/hd/",
+          output.list.name = "healthy",
+          technology = "SEQTR",
+          min_freq = 1e-4
+          )
+
+#plot_mean_counts(healthy, count_type = "count")
+p <- initial_data_qc(healthy, ncol = 4)
+
+pdf("/Users/endikaprieto/Desktop/healthy_initial_qc.pdf", width = 25, height = 15)
+p$plot
+dev.off()
+
+```
+# pt
+
+pt <- c("MSI001", "MoTriColor01", "MoTriColor03", "RIO008", "RIO009", "RIO025", "RIO029", "RIO069", "RIO136", "RIO142", "RIO208")
+pt <- c("NOUS_05", "NOUS_09", "NOUS_12", "NOUS_15", "NOUS_16", "NOUS_18")
+pt <- c("16097-101")
+pt <- c("NOUS_18_SEQTR")
+
+```{r, warning=FALSE}
+
+pt <- c("NOUS_18_SEQTR")
+
+load_data(samples = pt,
+          datapath.pbl = "/Volumes/datos_lab/tcrb/data_blood/patients/",
+          output.list.name = "patients",
+          technology = "SEQTR",
+          min_freq = min_freq
+          )
+
+plot_mean_counts(patients, count_type = "count")
+initial_data_qc(patients, ncol = 1)
+
+```
+
+# bcam collab
+
+Clonotype assignment and repertoire anonymization.
+
+```{r}
+# --- Function ---
+add_clono_codes <- function(x) {
+  if (!is.list(x) || length(x) == 0) {
+    stop("'x' must be a non-empty list.")
+  }
+  x_out <- x
+  mapping_list <- list()
+  for (sample_name in names(x)) {
+    sample_obj <- x[[sample_name]]
+    if (!is.list(sample_obj) || length(sample_obj) == 0) {
+      warning(sprintf("Skipping '%s': not a valid non-empty list.", sample_name))
+      next
+    }
+    aa_all <- unlist(
+      lapply(sample_obj, function(df) {
+        if (!"aminoAcid" %in% colnames(df)) {
+          stop(sprintf("Missing 'aminoAcid' in '%s'.", sample_name))
+        }
+        as.character(df$aminoAcid)
+      }),
+      use.names = FALSE
+    )
+    aa_unique <- unique(aa_all[!is.na(aa_all)])
+    sample_map <- data.frame(
+      aminoAcid = aa_unique,
+      clono = paste0("clono_", seq_along(aa_unique)),
+      stringsAsFactors = FALSE
+    )
+    mapping_list[[sample_name]] <- sample_map
+    for (tp_name in names(sample_obj)) {
+      df <- sample_obj[[tp_name]]
+      idx <- match(as.character(df$aminoAcid), sample_map$aminoAcid)
+      df$clono <- sample_map$clono[idx]
+      cols_to_remove <- intersect(c("nucleotide", "aminoAcid"), colnames(df))
+      df <- df[, setdiff(colnames(df), cols_to_remove), drop = FALSE]
+      x_out[[sample_name]][[tp_name]] <- df
+    }
+  }
+  return(list(
+    data = x_out,
+    mapping = mapping_list
+  ))
+}
+# --- Save data for sharing ---
+bcam.path <- "/Users/endikaprieto/Library/CloudStorage/OneDrive-VHIO/collabs/BCAM-BIlbao/VHIO-BCAM-Shared"
+# --- Healthy donors ---
+res_healthy <- add_clono_codes(healthy)
+
+healthy_with_clono <- res_healthy$data
+saveRDS(healthy_with_clono, file.path(bcam.path, "Healthy-Data-Anonymized.rds"))
+
+healthy_clono_mapping <- res_healthy$mapping
+saveRDS(healthy_clono_mapping, file.path(bcam.path, "Healthy-Clono-Key.rds"))
+# --- Patients ---
+res_patients <- add_clono_codes(patients)
+
+patients_with_clono <- res_patients$data
+saveRDS(patients_with_clono, file.path(bcam.path, "Patients-Data-Anonymized.rds"))
+
+patients_clono_mapping <- res_patients$mapping
+saveRDS(patients_clono_mapping, file.path(bcam.path, "Patients-Clono-Key.rds"))
+```
+
+# norm
+
+```{r}
+
+norm_data <- normalize_data_edgeR(healthy_data = "healthy",
+                                  patients_data = "patients")
+
+healthy <- norm_data[hd]
+patients <- norm_data[pt]
+
+plot_mean_counts(norm_data, count_type = "count")
+plot_mean_counts(norm_data, count_type = "count.norm")
+
+```
+
+calculate variability
+
+```{r, warning=FALSE, fig.width=12, fig.height=6}
+
+calculate_variability(input.data = "healthy")
+
+```
+
+# stats
+
+calculate p-values
+
+```{r, warning=F}
+
+day.limit = NULL
+
+calculate_statistics(input.data = "patients",
+                     day.limit = day.limit,
+                     p.val = 0.05
+                     )
+```
+
+# traj
+
+identify non-neutral trajectories
+
+```{r, warning=FALSE, fig.width=12, fig.height=6}
+
+identify_trajectories(input.data = "patients",
+                      day.limit = day.limit, 
+                      true.window = TRUE,
+                      filter.dropouts = FALSE,
+                      filter.na.valley = FALSE, na.valley = 4,
+                      traj.filter = FALSE
+                      )
+```
+
+# k
+
+run following chunks for each pt
+
+```{r, warning=F}
+
+sample = "NOUS_18_SEQTR"
+
+calculate_k_means(input.data = "patients",
+                  sample = sample,
+                  day.limit = day.limit,
+                  min_freq = min_freq
+                  )
+```
+
+# clust
+
+```{r, warning=FALSE, fig.width= 20}
+
+separate_trajectories(input.data = "patients",
+                      sample = sample,
+                      max.freq = 2,
+                      n.col = 5,
+                      day.limit = day.limit,
+                      k = 20
+                      )
+```
+
+# high
+
+```{r, warning=FALSE, fig.width= 20}
+
+highligth_trajectories(input.data = "patients",
+                       sample = sample,
+                       day.limit = day.limit,
+                       filter.traj = TRUE,
+                       max.freq = 5,
+                       top.n.clonotypes = 500,
+                       plot.time = TRUE,
+                       #icb.1 = c(0,12,42,56,84,112,140,154,166,182,196,210),
+                       biopsy.day = 0,
+                       datapath.annot = "/Volumes/datos_lab/tcrb/data_tumor", 
+                       technology = "hsd",
+                       )
+```
+
+# traj tum
+
+```{r, warning=FALSE}
+
+names(pbl_tumor[[sample]])
+biopsy <- "p136-TILs_TCRB in frame"
+max.biopsy = 1000
+
+calculate_k_means(input.data = "pbl_tumor",
+                  sample = sample,
+                  weight.frequency = 0.2,
+                  weight.jumps = 0.2,
+                  weight.na.pattern = 0.1,
+                  weight.contractions = 0.5,
+                  day.limit = day.limit,
+                  biopsy = biopsy,
+                  mode = "fold-change",
+                  max.biopsy = max.biopsy
+                  )
+```
+
+
+```{r, warning=FALSE, fig.width= 20}
+
+separate_trajectories(input.data = "pbl_tumor",
+                      sample = sample,
+                      max.freq = 10,
+                      day.limit = NULL,
+                      biopsy = biopsy,
+                      k = 10
+                      )
+
+```
+
+
+```{r, warning=FALSE, fig.width=16, fig.height=8}
+
+highligth_trajectories(input.data = "pbl_tumor",
+                       sample = sample,
+                       biopsy = biopsy,
+                       filter.traj = TRUE,
+                       max.biopsy = max.biopsy,
+                       day.limit = day.limit
+                       )
+```
+
+#capture
+
+Internal control: number of clonotypes found in biopsies between trajectory or randomly selected clonotypes in blood. Is Bilobide enriched in PBL-TIL?
+
+```{r, message=FALSE, warning=FALSE}
+
+count_clonotypes(sample = sample, n_iter = 25)
+
+```
+
+# save
+
+```{r}
+
+save_data(datapath = "/Users/endikaprieto/Desktop",
+          export.raw.data = TRUE,
+          dpi = 200)
+
+```
+
+# add-on
+
+Trajectories of the TCR library clonotypes.
+
+```{r, message=FALSE, warning=FALSE}
+
+# non-neutral clonotypes:
+path <- "/Users/endikaprieto/Library/CloudStorage/OneDrive-VHIO/pbl/bulk/tools/tcr_beta_dynamics_analysis-main_EP/analyses/360RIO/results/RIO136/pbl_non_neutral_filtered_RIO136.tsv"
+data <- read.table(path, sep = "\t", header = TRUE) %>%
+  mutate(TRBV = str_extract(nucleotide, "TCRBV[0-9]+-0?[0-9]"),
+         TRBV = gsub("-0", "-", TRBV),
+         TRBV = gsub("TCRBV0", "TCRBV", TRBV),
+         TRBV = gsub("TCRBV", "TRBV", TRBV),
+         TRBJ = str_extract(nucleotide, "TCRBJ[0-9]+-0?[0-9]"),
+         TRBJ = gsub("-0", "-", TRBJ),
+         TRBJ = gsub("TCRBJ0", "TCRBJ", TRBJ),
+         TRBJ = gsub("TCRBJ", "TRBJ", TRBJ),
+  ) %>%
+  mutate(trb = paste0(aminoAcid, "_", TRBV, "_", TRBJ))
+
+# viral info, RIO136 HLA-restricted:
+path <- "/Users/endikaprieto/Library/CloudStorage/OneDrive-VHIO/tcr_pbl/single_cell/sc_pipeline/patients/RIO136/outs/vdjdb/vdjdb_rio136_trb.tsv"
+vdjdb <- read_tsv(path, col_names = TRUE) %>%
+  as.data.frame() %>%
+  select(2:13) %>%
+  mutate(
+    V = sub("\\*.*", "", V),
+    J = sub("\\*.*", "", J)
+  ) %>%
+  mutate(TCRb = paste0(CDR3, "_", V, "_", J)) %>%
+  select(-CDR3, -V, -J, -Gene, -Species)
+data <- data %>% left_join(vdjdb, by = "TCRb")
+
+# Tested TCR:
+path <- "/Volumes/labagros/pierre/proj/rootpath/TCR_library_screen/RIO136/TCRlib_rio136/TXTO_TCRTable_VHIOwv1_5Criteria_1001TCRs_20201110_154539.tsv"
+tcr_lib <- read_tsv(path, col_names = FALSE) %>%
+  mutate(X14 = paste0("TRA:", X3, ";TRB:", X6)) %>%
+  select(X1, X2, X3, X4, X5, X6, X7, X14) %>%
+  as.data.frame()
+colnames(tcr_lib) <- c("id", "trav", "tra", "traj", "trbv", "trb", "trbj", "tcr")
+tcr_lib <- tcr_lib %>%
+  mutate(
+    trav = sub("\\*.*", "", trav),
+    traj = sub("\\*.*", "", traj),
+    trbv = sub("\\*.*", "", trbv),
+    trbj = sub("\\*.*", "", trbj),
+  ) %>%
+  mutate(
+    TCRb = paste0(trb, "_", trbv, "_", trbj),
+    TCRa = paste0(tra, "_", trav, "_", traj)
+  )
+
+## hits
+hits <- read.table("/Users/endikaprieto/Library/CloudStorage/OneDrive-VHIO/tcr_pbl/tcr_libraries/analysis/rio136_tcr_pipeline_ratio/results/TCRlib_all_hits.txt")$V1
+hits <- gsub("VHIOwv1_", "", hits)
+tcr_lib$hits <- ifelse(tcr_lib$id %in% hits, "Y", "N")
+
+## validation
+validated <- paste0("ChosenID.", c(12, 143, 146, 159, 16, 187, 195, 214, 23, 24, 232, 295, 31, 440, 445, 525, 531, 572, 618, 60, 640, 83, 94))
+unknown <- paste0("ChosenID.", c(347, 484, 684))
+tcr_lib$reactive <- ifelse(tcr_lib$id %in% validated, "Y", "unknown")
+tcr_lib$reactive <- ifelse(tcr_lib$id %in% unknown, "N", tcr_lib$reactive)
+
+## private or shared
+private <- paste0("ChosenID.", c(12, 146, 159, 214, 23, 684, 484, 525, 531, 618, 347, 24))
+shared <- paste0("ChosenID.", c(143, 16, 195, 295, 31, 232, 187, 640, 440, 572, 60, 83, 94, 445))
+tcr_lib$type <- ifelse(tcr_lib$id %in% private, "private", "unknown")
+tcr_lib$type <- ifelse(tcr_lib$id %in% shared, "shared", tcr_lib$type)
+tcr_lib <- tcr_lib %>%
+  select(TCRb, id, hits, reactive, type) %>%
+  group_by(TCRb, hits, reactive, type) %>%
+  summarize(id = paste(id, collapse = ","), .groups = "drop") %>%
+  distinct()
+data <- data %>% left_join(tcr_lib, by = "TCRb")
+
+# complete data
+metadata <- data %>% select(-time, -freq_in, -log10value, -count) %>% distinct()
+timepoints <- unique(data$time)
+data <- data %>%
+  select(nucleotide, time, freq_in, count) %>%
+  complete(nucleotide,
+           time = timepoints,
+           fill = list(freq_in = 0.0001, count = 0)
+           ) %>%
+  left_join(metadata, by = "nucleotide") %>% as.data.frame() %>% distinct()
+data <- data %>% mutate(log10value = log10(freq_in))
+
+# plot
+
+long_data <- data %>% filter(traj %in% c(1, 5, 6, 7, 12, 27:30))
+long_data <- data
+timepoints <- length(unique(long_data$time))
+
+count_traj <- long_data %>%
+  group_by(traj) %>%
+  summarise(
+    count_total = n() / timepoints,
+    .groups = "drop"
+    )
+
+
+plot <- ggplot() +
+  
+  # Ribbon for uncertainty (95% quantile range)
+  geom_ribbon(data = long_data %>% 
+                filter(nucleotide != "cumulative_frequency") %>%
+                group_by(traj, time) %>%
+                summarise(ymin = quantile(log10value, 0.05, na.rm = TRUE),
+                          ymax = quantile(log10value, 0.95, na.rm = TRUE),
+                          .groups = "drop"),
+              aes(x = time, ymin = ymin, ymax = ymax),
+              fill = "gray70", alpha = 0.25) +
+  
+  # Mean trajectory line
+  geom_line(data = long_data %>% 
+              filter(nucleotide != "cumulative_frequency") %>%
+              group_by(traj, time) %>%
+              summarise(mean_value = mean(log10value, na.rm = TRUE),
+                        .groups = "drop"),
+            aes(x = time, y = mean_value),
+            color = "black", linewidth = 0.5, linetype = "dashed") +
+  
+  # Filtered lines where hits == "Y", painted by a variable (e.g., 'nucleotide')
+  geom_line(data = long_data %>% 
+              filter(long_data$p136.Tfrozen_TCRB.in.frame == "Y"),
+            aes(x = time, y = log10value, color = nucleotide),
+            size = 0.5, alpha = 0.7) +
+  
+  theme_minimal() +
+  
+  scale_x_continuous() +
+  scale_y_continuous(
+    breaks = log10(c(0.0001, 0.001, 0.01, 0.1, 1, 10, 100)),
+    labels = c("0.0001", "0.001", "0.01", "0.1", "1", "10", "100"),
+    limits = c(log10(0.0001), log10(100))
+    ) +
+  
+  labs(y = "frequency") +
+  facet_wrap(~traj, ncol = 5) +
+  
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.2),
+    aspect.ratio = 0.5, legend.position = "none"
+    ) +
+  
+  # Add count labels for each trajectory
+  geom_text(data = count_traj,
+            aes(x = 25, y = 0.5, label = count_total),
+            inherit.aes = FALSE,
+            position = position_nudge(y = 0), size = 4)
+
+
+
+```
+
+Tag non-neutral clonotypes into CD4+ or CD8+ T cells.
+
+```{r}
+
+# Load single-cell data.
+
+library(Seurat)
+
+sc.data.cd8 <- readRDS("/Users/endikaprieto/Library/CloudStorage/OneDrive-VHIO/pbl/single_cell/sc_pipeline/patients/RIO136/seurat/int_cd8_annot.rds")@meta.data
+cd8 <- unique(sc.data.cd8$trb)
+sc.data.cd4 <- readRDS("/Users/endikaprieto/Library/CloudStorage/OneDrive-VHIO/pbl/single_cell/sc_pipeline/patients/RIO136/seurat/int_cd4_annot.rds")@meta.data
+cd4 <- unique(sc.data.cd4$trb)
+
+# Load non-neutral clonotyopes.
+
+path <- "/Users/endikaprieto/Library/CloudStorage/OneDrive-VHIO/pbl/bulk/tools/tcr_beta_dynamics_analysis-main_EP/analyses/360RIO/results/RIO136/pbl_raw_RIO136.tsv"
+non.neutral <- read.table(path, sep = "\t", header = TRUE) %>%
+  mutate(TRBV = str_extract(nucleotide, "TCRBV[0-9]+-0?[0-9]"),
+         TRBV = gsub("-0", "-", TRBV),
+         TRBV = gsub("TCRBV0", "TCRBV", TRBV),
+         TRBV = gsub("TCRBV", "TRBV", TRBV),
+         TRBJ = str_extract(nucleotide, "TCRBJ[0-9]+-0?[0-9]"),
+         TRBJ = gsub("-0", "-", TRBJ),
+         TRBJ = gsub("TCRBJ0", "TCRBJ", TRBJ),
+         TRBJ = gsub("TCRBJ", "TRBJ", TRBJ),
+  ) %>%
+  mutate(trb = paste0(aminoAcid, "_", TRBV, "_", TRBJ)) %>% select(-TRBV, -TRBJ)
+
+compartment <- non.neutral %>%
+  mutate(compartment = case_when(
+    trb %in% cd4 ~ "cd4",
+    trb %in% cd8 ~ "cd8",
+    TRUE ~ "unknown"
+  )) %>%
+  select(nucleotide, compartment) %>%
+  distinct()
+
+non.neutral <- non.neutral %>% left_join(compartment, by = "nucleotide") %>% select(-trb)
+
+cumulative <- non.neutral %>% select(nucleotide, time, freq_in, compartment)
+
+cumulative.cd4 <- cumulative %>%
+  filter(compartment == "cd4") %>%
+  group_by(time) %>%
+  summarise(total_freq = sum(freq_in)) %>%
+  arrange(time)
+write.table(cumulative.cd4, file.path(dirname(path), "cumulative_frequency_cd4.tsv"), sep = "\t", col.names = TRUE, row.names = FALSE)
+
+cumulative.cd8 <- cumulative %>%
+  filter(compartment == "cd8") %>%
+  group_by(time) %>%
+  summarise(total_freq = sum(freq_in)) %>%
+  arrange(time)
+write.table(cumulative.cd8, file.path(dirname(path), "cumulative_frequency_cd8.tsv"), sep = "\t", col.names = TRUE, row.names = FALSE)
+
+cumulative.unknown <- cumulative %>%
+  filter(compartment == "unknown") %>%
+  group_by(time) %>%
+  summarise(total_freq = sum(freq_in)) %>%
+  arrange(time)
+write.table(cumulative.unknown, file.path(dirname(path), "cumulative_frequency_unknown.tsv"), sep = "\t", col.names = TRUE, row.names = FALSE)
+
+```
+
