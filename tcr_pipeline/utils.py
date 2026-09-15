@@ -61,6 +61,71 @@ def count_nan_trajectories(
 
     raise ValueError(f"fmt must be 'long' or 'wide', got '{fmt}'")
 
+def summarize_nan_trajectories(
+    df: pd.DataFrame,
+    patient_col: str = "patient",
+    clono_col: str = "clono",
+    day_col: str = "day",
+    count_col: str = "count",
+) -> pd.DataFrame:
+    """
+    Summarize NaN trajectory counts across all patients in a long-format DataFrame.
+
+    For each patient, reports the number of timepoints observed, total clonotype
+    count, and the number/percentage of clonotypes missing 1, 2, 3, ... timepoints.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Long-format DataFrame with columns: patient, day, clono, count.
+        Can be the full healthy_df or any multi-patient long-format slice.
+        NaNs in count_col are treated as missing observations.
+    patient_col, clono_col, day_col, count_col : str
+        Column name overrides.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per (patient, n_missing) combination, with columns:
+            patient         : donor/patient identifier
+            n_timepoints    : total timepoints for that patient (days observed)
+            n_clonotypes    : total clonotypes for that patient
+            n_missing       : number of missing timepoints (0, 1, 2, ...)
+            n_clono         : number of clonotypes with exactly that many missing
+            pct_clono       : percentage of clonotypes (out of n_clonotypes)
+    """
+    records = []
+
+    for patient, pdf in df.groupby(patient_col):
+        days = pdf[day_col].nunique()
+        n_clono_total = pdf[clono_col].nunique()
+
+        # Pivot to clono x day to detect structural absences as well as NaN counts
+        pivot = pdf.pivot_table(
+            index=clono_col,
+            columns=day_col,
+            values=count_col,
+            aggfunc="first",   # one count per (clono, day) expected
+        )
+
+        # Each row: count NaN cells (absent or explicitly NaN)
+        nan_counts = pivot.isna().sum(axis=1)  # Series: clono -> n_missing
+
+        # Distribution over n_missing values
+        dist = nan_counts.value_counts().sort_index()
+
+        for n_missing, n_clono in dist.items():
+            records.append({
+                patient_col:     patient,
+                "n_timepoints":  days,
+                "n_clonotypes":  n_clono_total,
+                "n_missing":     int(n_missing),
+                "n_clono":       int(n_clono),
+                "pct_clono":     round(100 * n_clono / n_clono_total, 2),
+            })
+
+    return pd.DataFrame(records).rename(columns={patient_col: patient_col})
+
 def impute_trajectories(
     df: pd.DataFrame,
     values: str = 'count',

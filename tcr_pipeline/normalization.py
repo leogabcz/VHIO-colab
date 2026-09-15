@@ -153,16 +153,16 @@ def tmm_normalize(
     df: pd.DataFrame,
     trim_m: float = 0.3,
     trim_a: float = 0.05,
-    output_col: str = "tmm_norm",
+    factor_col: str = "tmm_factor",
 ) -> pd.DataFrame:
     """
-    Apply TMM (Trimmed Mean of M-values) normalization within each patient,
-    using that patient's timepoints as the set of samples.
- 
-    Each timepoint is normalized relative to a reference timepoint (the one
-    whose total count is closest to the mean across all timepoints of that
-    patient). 
-    
+    Compute TMM (Trimmed Mean of M-values) normalization factors within each
+    patient, using that patient's timepoints as the set of samples.
+
+    Each timepoint's factor is computed relative to a reference timepoint
+    (the one whose total count is closest to the mean across all timepoints
+    of that patient). The reference timepoint gets factor = 1.0.
+
     Parameters
     ----------
     df : pd.DataFrame
@@ -173,80 +173,68 @@ def tmm_normalize(
     trim_a : float
         Fraction of features to trim from each tail of the A-value
         (mean log-count) distribution. Default 0.05.
-    output_col : str
-        Name of the new column added to hold TMM-normalized CPM values.
- 
+    factor_col : str
+        Name of the new column added to hold the raw TMM factor.
+
     Returns
     -------
     pd.DataFrame
-        Copy of the input with an additional column `output_col`.
-        Values are TMM-normalized counts per million (CPM).
-    
+        Copy of the input with an additional column `factor_col`, the raw
+        per-(patient, day) multiplicative correction factor (centered near
+        1). This is the correction factor itself — NOT a normalized count —
+        and is what should be passed to _attach_lib's `norm_factors`, used
+        as `lib = raw_lib * factor`. It must be multiplied onto raw library
+        size, never used to divide or rescale counts directly.
+
     References
     ----------
     Robinson, M.D. & Oshlack, A. (2010). A scaling normalization method for
     differential expression analysis of RNA-seq data. Genome Biology, 11, R25.
     """
     result = df.copy()
-    tmm_values = np.full(len(result), np.nan)
- 
+    result[factor_col] = np.nan
+
     for patient, patient_df in result.groupby("patient"):
-        # Build count matrix: rows = clonotypes, columns = timepoints
         pivot = patient_df.pivot_table(
             index="clono", columns="day", values="count", fill_value=0
         )
-        lib_sizes = pivot.sum(axis=0)  # total counts per timepoint
- 
-        # Select reference timepoint: closest total count to the mean
+        lib_sizes = pivot.sum(axis=0)
         mean_lib = lib_sizes.mean()
         ref_day = (lib_sizes - mean_lib).abs().idxmin()
- 
+
         norm_factors = {}
         for day in pivot.columns:
             if day == ref_day:
                 norm_factors[day] = 1.0
                 continue
- 
             counts_t   = pivot[day].values.astype(float)
             counts_ref = pivot[ref_day].values.astype(float)
             lib_t   = lib_sizes[day]
             lib_ref = lib_sizes[ref_day]
- 
-            # Keep only clonotypes observed in both timepoints
+
             keep = (counts_t > 0) & (counts_ref > 0)
             if keep.sum() < 3:
                 norm_factors[day] = 1.0
                 continue
- 
-            ct  = counts_t[keep]
-            cr  = counts_ref[keep]
- 
-            # M and A values
-            log_t   = np.log2(ct / lib_t)
-            log_ref = np.log2(cr / lib_ref)
+
+            ct, cr = counts_t[keep], counts_ref[keep]
+            log_t, log_ref = np.log2(ct / lib_t), np.log2(cr / lib_ref)
             m = log_t - log_ref
             a = 0.5 * (log_t + log_ref)
- 
-            # Trim by M and A
+
             m_lo, m_hi = np.quantile(m, [trim_m, 1 - trim_m])
             a_lo, a_hi = np.quantile(a, [trim_a, 1 - trim_a])
             trimmed = (m >= m_lo) & (m <= m_hi) & (a >= a_lo) & (a <= a_hi)
- 
             if trimmed.sum() < 3:
                 norm_factors[day] = 1.0
                 continue
- 
-            # Weighted mean of trimmed M-values
+
             weights = 1.0 / ct[trimmed] + 1.0 / cr[trimmed]
             norm_factors[day] = 2 ** np.average(m[trimmed], weights=weights)
- 
-        # Apply normalization factors -> CPM
+
         for day, factor in norm_factors.items():
             mask = (result["patient"] == patient) & (result["day"] == day)
-            lib = lib_sizes[day]
-            result.loc[mask, output_col] = (
-                result.loc[mask, "count"] / (lib * factor) * 1e6
-            )
- 
+            result.loc[mask, factor_col] = factor
+
     return result
  

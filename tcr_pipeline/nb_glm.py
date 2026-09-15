@@ -1,24 +1,80 @@
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 from scipy import stats
-from scipy.optimize import minimize_scalar
-from statsmodels.nonparametric.smoothers_lowess import lowess
-from typing import Optional
+from scipy.optimize import minimize_scalar  # was missing from the current file
+from typing import Optional, Union
+import statsmodels.api as sm
 
+def _attach_lib(
+    df: pd.DataFrame,
+    count_col: str,
+    norm_factors: Optional[Union[pd.Series, pd.DataFrame, str]] = None,
+) -> pd.DataFrame:
+    """
+    Attach per-(patient, day) library size to `df` as column 'lib'.
+
+    lib = raw read total, optionally scaled by a normalization factor:
+        lib_i = raw_lib_i * norm_factor_i
+
+    raw_lib_i is always computed from `count_col` (must be RAW counts).
+    norm_factors corrects for composition effects (a few hyperexpanded
+    clonotypes skewing raw depth) — same role as DESeq2's/edgeR's size
+    factors, applied on top of raw depth, never in place of it. The
+    correction method itself (TMM, median-of-ratios, etc.) is up to the
+    caller — this function just applies whatever factor it's given.
+
+    Parameters
+    ----------
+    norm_factors : one of
+        - Series indexed by (patient, day) with the normalization factor
+        - DataFrame with columns ['patient', 'day', 'norm_factor']
+        - str: name of a column ALREADY present in `df` holding the
+          per-row normalization factor (no merge needed)
+        - None: lib is just the raw per-(patient, day) count sum
+
+    Any (patient, day) group left with non-finite or non-positive lib
+    is dropped, with a note on how many groups were removed.
+    """
+    raw_lib = (
+        df.groupby(['patient', 'day'])[count_col]
+        .sum().rename('raw_lib').reset_index()
+    )
+    df = df.merge(raw_lib, on=['patient', 'day'], how='left')
+
+    if norm_factors is None:
+        df['lib'] = df['raw_lib']
+    elif isinstance(norm_factors, str):
+        if norm_factors not in df.columns:
+            raise ValueError(f"norm_factors='{norm_factors}' is not a column in df")
+        df['lib'] = df['raw_lib'] * df[norm_factors]
+    else:
+        if isinstance(norm_factors, pd.Series):
+            factor_df = norm_factors.rename('norm_factor').reset_index()
+        else:
+            factor_df = norm_factors.rename(columns={norm_factors.columns[-1]: 'norm_factor'}) \
+                if 'norm_factor' not in norm_factors.columns else norm_factors
+        df = df.merge(factor_df, on=['patient', 'day'], how='left')
+        df['lib'] = df['raw_lib'] * df['norm_factor']
+
+    bad = ~np.isfinite(df['lib']) | (df['lib'] <= 0)
+    if bad.any():
+        n_bad = df.loc[bad, ['patient', 'day']].drop_duplicates().shape[0]
+        print(f"_attach_lib: dropping {n_bad} (patient, day) groups "
+              f"with non-finite/zero lib")
+        df = df.loc[~bad].copy()
+
+    drop_cols = ['raw_lib']
+    if 'norm_factor' in df.columns:
+        drop_cols.append('norm_factor')
+    return df.drop(columns=drop_cols)
 
 def _pooled_mu(sub: pd.DataFrame, count_col: str) -> np.ndarray:
     """
     Per-observation expected mean count for one clonotype, under a shared
     relative-frequency assumption across its timepoints.
 
-    The clonotype's pooled frequency (total counts / total library size,
-    across all its timepoints) is projected onto each timepoint's own
-    library size to give mu_i = pooled_freq * lib_i. This is the "expected
-    count under the null of constant frequency" used as the NB mean when
-    fitting dispersion.
-
-    Requires `sub` to already have a 'lib' column (see add_library_sizes).
+    mu_i = pooled_freq * lib_i, where pooled_freq = sum(count)/sum(lib).
+    Requires `sub` to already have a 'lib' column (see _attach_lib).
     """
     pooled_freq = sub[count_col].sum() / sub['lib'].sum()
     return pooled_freq * sub['lib'].values.astype(float)
@@ -27,20 +83,70 @@ def _pooled_mu(sub: pd.DataFrame, count_col: str) -> np.ndarray:
 def _nb_neg_loglik(log_phi: float, x: np.ndarray, mu: np.ndarray) -> float:
     """
     Negative log-likelihood of x ~ NB(mu, phi), summed over observations.
-
-    Uses the scipy.stats.nbinom parameterization n=phi (size), p=phi/(phi+mu),
-    equivalent to the Gamma-Poisson mixture with mean mu and dispersion phi
-    (variance = mu + mu^2/phi). Optimized in log-space (log_phi) so that
-    phi = exp(log_phi) is guaranteed positive regardless of the search bounds.
+    x MUST be raw counts — this is derived from the NB pmf, not valid on
+    normalized/frequency data.
     """
     phi = np.exp(log_phi)
     p = phi / (phi + mu)
     return -np.sum(stats.nbinom.logpmf(x, phi, p))
 
 
+def fit_nb_dispersion_mle(
+    df: pd.DataFrame,
+    count_col: str = 'count',
+    norm_factors: Optional[Union[pd.Series, pd.DataFrame, str]] = None,
+    min_obs: int = 2,
+    floor_mu: float = 1e-8,
+) -> dict:
+    """
+    Maximum-likelihood estimate of a single shared NB dispersion (phi) from
+    healthy-donor data.
+
+    ... (docstring unchanged) ...
+
+    Returns
+    -------
+    dict
+        'phi'    : float, MLE of the shared dispersion (size).
+        'x_all'  : np.ndarray, the raw counts actually used in the fit.
+        'mu_all' : np.ndarray, the corresponding fitted means used in the fit.
+    """
+    df = _attach_lib(df, count_col, norm_factors)
+
+    xs, mus = [], []
+    for _, sub in df.groupby(['patient', 'clono']):
+        if len(sub) < min_obs:
+            continue
+        mu = _pooled_mu(sub, count_col)
+        x = sub[count_col].values.astype(float)
+        keep = np.isfinite(mu) & (mu > floor_mu)
+        if keep.sum() < min_obs:
+            continue
+        xs.append(x[keep])
+        mus.append(mu[keep])
+
+    if not xs:
+        raise ValueError("No clonotypes with enough observations to fit phi.")
+
+    x_all = np.concatenate(xs)
+    mu_all = np.concatenate(mus)
+
+    res = minimize_scalar(
+        _nb_neg_loglik,
+        args=(x_all, mu_all),
+        bounds=(np.log(1e-3), np.log(1e6)),
+        method='bounded',
+    )
+
+    return {
+        'phi': float(np.exp(res.x)),
+        'x_all': x_all,
+        'mu_all': mu_all,
+    }
+
 def nb_glm_trajectory_test(
     df: pd.DataFrame,
-    phi: float,
+    dispersion,
     count_col: str = 'count',
     time_col: str = 'day',
     min_obs: int = 3,
@@ -51,14 +157,14 @@ def nb_glm_trajectory_test(
 
     For each (patient, clonotype) the model is:
 
-        x_ci ~ NB(mu_ci, phi)
+        x_ci ~ NB(mu_ci, phi_c)
         log mu_ci = alpha_c + beta_c * t_i + log N_i
 
     where:
         log N_i  : fixed offset (library size) -> turns counts into rates
         alpha_c  : baseline log-frequency (intercept)
         beta_c   : log-frequency slope per unit time (the quantity of interest)
-        phi      : shared dispersion (e.g. from fit_nb_dispersion_mle)
+        phi_c    : NB dispersion for this clonotype — see `dispersion` below
 
     Neutrality is H0: beta_c = 0. The slope is tested either by a likelihood-
     ratio test against the intercept-only (+offset) model (default, robust at
@@ -71,9 +177,16 @@ def nb_glm_trajectory_test(
     ----------
     df : pd.DataFrame
         Long-format, grid-completed with explicit zeros.
-        Columns: patient, day (time), clono, count.
-    phi : float
-        Shared NB dispersion (size). statsmodels uses alpha = 1/phi internally.
+        Columns: patient, day (time), clono, count, lib
+        ('lib' must already be attached — see add_library_sizes / _attach_lib).
+    dispersion : float or dict
+        float : a single shared NB dispersion (phi) used for every clonotype
+                (e.g. from fit_nb_dispersion_mle).
+        dict  : a trended dispersion model from fit_nb_dispersion_trended.
+                Each clonotype's phi is looked up via phi_for_freq using its
+                own mean frequency (sum(count)/sum(lib)), falling back to
+                the model's global_phi for bins with too few clonotypes or
+                a boundary-pinned fit.
     count_col, time_col : str
         Column names for raw counts and the time covariate.
     min_obs : int
@@ -91,13 +204,14 @@ def nb_glm_trajectory_test(
             stat      : test statistic (LRT chi2 or Wald z)
             p_value   : two-sided p-value for H0: beta = 0
             n_obs     : timepoints used
-            direction : 'expansion' / 'contraction' / 'flat'
+            phi_used  : the dispersion actually used for this clonotype
+            direction : 'expansion' / 'contraction' / 'flat' / 'failed'
+                        ('failed' = fit did not produce a finite beta;
+                        distinct from 'flat', which means beta == 0 exactly)
             converged : whether the GLM fit converged
     """
-    alpha = 1.0 / phi  # statsmodels NB dispersion parameterisation
-    fam = sm.families.NegativeBinomial(alpha=alpha)
-
     rows = []
+
     for (patient, clono), sub in df.groupby(['patient', 'clono']):
         sub = sub.sort_values(time_col)
         n = len(sub)
@@ -108,16 +222,22 @@ def nb_glm_trajectory_test(
         t = sub[time_col].values.astype(float)
         lib = sub['lib'].values.astype(float)
 
-        # need variation in time and at least one nonzero count to fit a slope
         if np.ptp(t) == 0 or y.sum() == 0:
             continue
 
-        offset = np.log(lib)
-        # center time for numerical stability of the intercept (slope unchanged)
-        t_c = t - t.mean()
+        if isinstance(dispersion, dict):
+            total_lib = lib.sum()
+            mean_freq = y.sum() / total_lib if total_lib > 0 else 0.0
+            phi = phi_for_freq(dispersion, mean_freq)
+        else:
+            phi = dispersion
+        alpha = 1.0 / phi
+        fam = sm.families.NegativeBinomial(alpha=alpha)
 
-        X_full = sm.add_constant(t_c)                  # intercept + slope
-        X_null = np.ones((n, 1))                       # intercept only
+        offset = np.log(lib)
+        t_c = t - t.mean()
+        X_full = sm.add_constant(t_c)
+        X_null = np.ones((n, 1))
 
         beta = se = stat = pval = np.nan
         converged = False
@@ -139,7 +259,9 @@ def nb_glm_trajectory_test(
         except Exception:
             pass
 
-        if beta > 0:
+        if not np.isfinite(beta):
+            direction = 'failed'
+        elif beta > 0:
             direction = 'expansion'
         elif beta < 0:
             direction = 'contraction'
@@ -149,11 +271,10 @@ def nb_glm_trajectory_test(
         rows.append({
             'patient': patient, 'clono': clono,
             'beta': beta, 'se_beta': se, 'stat': stat, 'p_value': pval,
-            'n_obs': n, 'direction': direction, 'converged': converged,
+            'n_obs': n, 'phi_used': phi, 'direction': direction, 'converged': converged,
         })
 
     return pd.DataFrame(rows)
-
 
 def add_library_sizes(df: pd.DataFrame, count_col: str = 'count') -> pd.DataFrame:
     """Attach per (patient, day) library size as column 'lib'."""
@@ -186,343 +307,151 @@ def bh_correct(pvals: pd.Series) -> pd.Series:
     result[mask] = out
     return result
 
-def fit_nb_dispersion_mle(
-    df: pd.DataFrame,
-    count_col: str = 'count',
-    min_obs: int = 2,
-    floor_mu: float = 1e-8,
-) -> float:
-    """
-    Maximum-likelihood estimate of a single shared NB dispersion (phi) from
-    healthy-donor data.
-
-    Each clonotype contributes its own pooled mean frequency (projected onto
-    per-timepoint library sizes); phi is shared and found by maximising the
-    total NB log-likelihood over all clonotype-timepoint observations.
-
-    Operates on RAW COUNTS, grid-completed with explicit zeros (a zero is an
-    informative observation under NB, not missing data).
-
-    min_obs gates on REAL DETECTIONS (count > 0), not row count. On
-    grid-completed data every clonotype has the same number of rows
-    (n_timepoints), so filtering on len(sub) is a no-op; the actual
-    information content of a clonotype's contribution to dispersion
-    estimation depends on how many nonzero counts it has, not how many
-    grid rows exist.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Long-format, grid-completed with explicit zeros.
-        Columns: patient, day, clono, count.
-    count_col : str
-        Raw count column.
-    min_obs : int
-        Minimum number of REAL (nonzero) detections a clonotype must have
-        to contribute. Default 2 (need at least 2 detections to say
-        anything about variance/dispersion).
-    floor_mu : float
-        Lower floor on per-observation mean to keep the likelihood finite
-        when a clonotype's pooled frequency is ~0.
-
-    Returns
-    -------
-    float
-        MLE of the shared dispersion phi (size). Larger -> closer to Poisson.
-    """
-    lib = df.groupby(['patient', 'day'])[count_col].sum().rename('lib').reset_index()
-    df = df.merge(lib, on=['patient', 'day'], how='left')
-
-    xs, mus = [], []
-    for _, sub in df.groupby(['patient', 'clono']):
-        n_nonzero = int((sub[count_col] > 0).sum())
-        if n_nonzero < min_obs:
-            continue
-        mu = _pooled_mu(sub, count_col)
-        x = sub[count_col].values.astype(float)
-        # drop observations where mu is essentially zero (clonotype never seen)
-        keep = mu > floor_mu
-        if keep.sum() < min_obs:
-            continue
-        xs.append(x[keep])
-        mus.append(mu[keep])
-
-    if not xs:
-        raise ValueError("No clonotypes with enough observations to fit phi.")
-
-    x_all = np.concatenate(xs)
-    mu_all = np.concatenate(mus)
-
-    res = minimize_scalar(
-        _nb_neg_loglik,
-        args=(x_all, mu_all),
-        bounds=(np.log(1e-3), np.log(1e6)),
-        method='bounded',
-    )
-    return float(np.exp(res.x))
-
-
 def fit_nb_dispersion_trended(
     df: pd.DataFrame,
     count_col: str = 'count',
-    n_bins: int = 10,
+    norm_factors: Optional[Union[pd.Series, pd.DataFrame, str]] = None,
+    n_bins: int = 6,
     min_obs: int = 2,
+    min_bin_n: int = 5,
     floor_mu: float = 1e-8,
 ) -> dict:
     """
-    Mean-dependent (trended) NB dispersion: phi estimated by MLE within
-    quantile bins of mean frequency, capturing the fact that overdispersion
-    varies with abundance (the NB analogue of the stratified slope null).
+    Mean-dependent (trended) NB dispersion: phi estimated by pooled MLE
+    within quantile bins of per-clonotype mean frequency.
 
-    Returns a model dict with bin edges (on log mean-frequency) and the per-bin
-    phi, plus a lookup helper to map any mean frequency to its phi.
+    count_col MUST point at RAW integer counts (default 'count') — see
+    fit_nb_dispersion_mle for why. norm_factors scales `lib` (and therefore
+    mu), exactly as in fit_nb_dispersion_mle; it never touches x.
 
-    min_obs gates on REAL DETECTIONS (count > 0), not row count -- see
-    fit_nb_dispersion_mle docstring for why this matters on grid-completed
-    data.
+    Bins are quantile-based (equal number of clonotypes per bin), not
+    fixed-width in log-frequency — this keeps statistical power roughly
+    balanced across bins, which matters a lot here: clonotype frequency is
+    heavily right-skewed, so fixed decade bins put ~90% of clonotypes in
+    one or two bins and leave the rest severely underpowered (confirmed
+    empirically: quantile bins removed the boundary-pinning artifacts that
+    fixed-decade bins produced at the sparse end).
 
     Parameters
     ----------
     df : pd.DataFrame
         Long-format, grid-completed with explicit zeros.
+        Columns: patient, day, clono, and `count_col` (raw counts).
     count_col : str
-        Raw count column.
+        RAW count column. Default 'count'.
+    norm_factors : optional normalization factor, see fit_nb_dispersion_mle
+        / _attach_lib for accepted shapes (Series, DataFrame, or column name).
     n_bins : int
-        Number of mean-frequency quantile bins.
+        Number of quantile bins of mean frequency. Default 6 (validated
+        empirically for this dataset — revisit if clonotype counts change
+        substantially).
     min_obs : int
-        Minimum number of REAL (nonzero) detections per clonotype to contribute.
+        Minimum timepoints a clonotype must have to contribute at all.
+    min_bin_n : int
+        Minimum clonotypes required in a bin to fit that bin's own phi;
+        below this, the bin falls back to global_phi via phi_for_freq.
     floor_mu : float
-        Floor on per-observation mean.
+        Lower floor on per-observation mean to keep the likelihood finite.
 
     Returns
     -------
     dict
-        {
-          'logfreq_edges' : bin edges on log10 mean frequency,
-          'phi_per_bin'   : list of per-bin phi (None if a bin had too few obs),
-          'global_phi'    : fallback shared phi for empty/failed bins,
-        }
+        'logfreq_edges' : np.ndarray, quantile bin edges in log10(p_hat)
+        'phi_per_bin'   : list of float or None (None = fell back to
+                          global_phi, either too few clonotypes or the
+                          fit pinned at the optimizer's search bounds)
+        'bin_n'         : list of int, clonotypes contributing to each bin
+        'bin_at_bound'  : list of bool, True if that bin's fit was
+                          boundary-pinned (unreliable, treated as None)
+        'global_phi'    : float, pooled MLE across all clonotypes
     """
-    lib = df.groupby(['patient', 'day'])[count_col].sum().rename('lib').reset_index()
-    df = df.merge(lib, on=['patient', 'day'], how='left')
+    df = _attach_lib(df, count_col, norm_factors)
+    lo, hi = np.log(1e-3), np.log(1e6)
 
-    # collect per-clonotype observations plus a mean-frequency for binning
-    clono_obs = []   # (x_array, mu_array, mean_freq)
-    mean_freqs = []
+    p_hats = []
+    clono_xmu = []  # (x, mu) per clonotype, aligned with p_hats
+
     for _, sub in df.groupby(['patient', 'clono']):
-        n_nonzero = int((sub[count_col] > 0).sum())
-        if n_nonzero < min_obs:
+        if len(sub) < min_obs:
             continue
-        mu = _pooled_mu(sub, count_col)
+
+        p_hat = sub[count_col].sum() / sub['lib'].sum()
+        if p_hat <= 0 or not np.isfinite(p_hat):
+            continue
+
+        mu = p_hat * sub['lib'].values.astype(float)
         x = sub[count_col].values.astype(float)
-        keep = mu > floor_mu
+        keep = np.isfinite(mu) & (mu > floor_mu)
         if keep.sum() < min_obs:
             continue
-        total_lib = sub['lib'].sum()
-        mean_freq = sub[count_col].sum() / total_lib if total_lib > 0 else 0.0
-        if mean_freq <= 0:
-            continue
-        clono_obs.append((x[keep], mu[keep], mean_freq))
-        mean_freqs.append(mean_freq)
 
-    if not clono_obs:
+        p_hats.append(p_hat)
+        clono_xmu.append((x[keep], mu[keep]))
+
+    if not p_hats:
         raise ValueError("No clonotypes with enough observations to fit phi.")
 
-    mean_freqs = np.array(mean_freqs)
-    log_mf = np.log10(mean_freqs)
+    p_hats = np.array(p_hats)
+    log_p = np.log10(p_hats)
 
-    edges = np.quantile(log_mf, np.linspace(0, 1, n_bins + 1))
-    edges = np.unique(edges)
-    actual_bins = len(edges) - 1
+    # --- global phi, pooled across everything ---
+    x_all = np.concatenate([xm[0] for xm in clono_xmu])
+    mu_all = np.concatenate([xm[1] for xm in clono_xmu])
+    if np.any(~np.isfinite(mu_all)) or np.any(mu_all <= 0):
+        print("Warning: mu_all contains non-finite or non-positive values "
+              "after filtering — check norm_factors scale.")
+    res_global = minimize_scalar(_nb_neg_loglik, args=(x_all, mu_all),
+                                  bounds=(lo, hi), method='bounded')
+    global_phi = float(np.exp(res_global.x))
 
-    bin_idx = np.clip(np.digitize(log_mf, edges[1:-1]), 0, actual_bins - 1)
+    # --- quantile bin edges (equal n per bin) ---
+    bin_edges = np.quantile(log_p, np.linspace(0, 1, n_bins + 1))
+    bin_edges = np.unique(bin_edges)  # guard against duplicate quantiles
+    n_bins_actual = len(bin_edges) - 1
+    bin_idx = np.clip(np.digitize(log_p, bin_edges[1:-1]), 0, n_bins_actual - 1)
 
-    # global fallback phi (pool everything)
-    x_all = np.concatenate([c[0] for c in clono_obs])
-    mu_all = np.concatenate([c[1] for c in clono_obs])
-    res = minimize_scalar(
-        _nb_neg_loglik, args=(x_all, mu_all),
-        bounds=(np.log(1e-3), np.log(1e6)), method='bounded',
-    )
-    global_phi = float(np.exp(res.x))
+    phi_per_bin, bin_n, bin_at_bound = [], [], []
+    for b in range(n_bins_actual):
+        in_bin = bin_idx == b
+        n_in_bin = int(in_bin.sum())
+        bin_n.append(n_in_bin)
 
-    phi_per_bin = []
-    for b in range(actual_bins):
-        members = [clono_obs[i] for i in range(len(clono_obs)) if bin_idx[i] == b]
-        if len(members) < 5:
+        if n_in_bin < min_bin_n:
             phi_per_bin.append(None)
+            bin_at_bound.append(False)
             continue
-        xb = np.concatenate([m[0] for m in members])
-        mub = np.concatenate([m[1] for m in members])
-        rb = minimize_scalar(
-            _nb_neg_loglik, args=(xb, mub),
-            bounds=(np.log(1e-3), np.log(1e6)), method='bounded',
-        )
-        phi_per_bin.append(float(np.exp(rb.x)))
+
+        idx = np.where(in_bin)[0]
+        x_bin = np.concatenate([clono_xmu[j][0] for j in idx])
+        mu_bin = np.concatenate([clono_xmu[j][1] for j in idx])
+
+        res = minimize_scalar(_nb_neg_loglik, args=(x_bin, mu_bin),
+                               bounds=(lo, hi), method='bounded')
+        at_bound = np.isclose(res.x, lo, atol=1e-3) or np.isclose(res.x, hi, atol=1e-3)
+        bin_at_bound.append(at_bound)
+
+        if at_bound:
+            print(f"Warning: bin {b} ({bin_edges[b]:.2f}, {bin_edges[b+1]:.2f}) "
+                  f"pinned at optimizer bound (n={n_in_bin}) — falling back to global_phi")
+            phi_per_bin.append(None)
+        else:
+            phi_per_bin.append(float(np.exp(res.x)))
 
     return {
-        'logfreq_edges': edges,
+        'logfreq_edges': bin_edges,
         'phi_per_bin': phi_per_bin,
+        'bin_n': bin_n,
+        'bin_at_bound': bin_at_bound,
         'global_phi': global_phi,
     }
-
-
-def fit_nb_dispersion_trended_smooth(
-    df: pd.DataFrame,
-    count_col: str = 'count',
-    n_bins: int = 25,
-    min_obs: int = 2,
-    floor_mu: float = 1e-8,
-    min_bin_members: int = 5,
-    boundary_tol: float = 0.01,
-    lowess_frac: float = 0.6,
-    lowess_it: int = 3,
-) -> dict:
-    """
-    Trended NB dispersion via binned MLE + loess smoothing across bins
-    (edgeR-style bin.loess trend), replacing the per-bin step function
-    in fit_nb_dispersion_trended with a smooth interpolated curve.
-
-    min_obs gates on REAL DETECTIONS (count > 0), not row count -- see
-    fit_nb_dispersion_mle docstring. With this fix, single-detection
-    clonotypes (structural zeros everywhere else) no longer silently
-    inflate low-abundance bins with near-uninformative NB(1; mu~0, phi)
-    observations, which was the likely driver of the bin-1 boundary
-    artifact (MLE walled at the optimizer bound).
-
-    Pipeline:
-      1. Bin clonotypes into `n_bins` quantile bins of mean log-frequency.
-      2. Fit per-bin MLE dispersion (same as fit_nb_dispersion_trended).
-      3. Discard bins whose MLE sits within `boundary_tol` (relative) of the
-         optimizer's search bounds -- underdetermined, not real signal.
-      4. Loess-smooth log(phi) vs log-frequency bin center over the
-         remaining bins. Robustness iterations (`it`) further downweight
-         any residual outliers.
-
-    Returns
-    -------
-    dict with:
-        'bin_centers'    : log10 mean-freq bin centers used (reliable bins only)
-        'bin_log_phi'    : raw per-bin log(phi) MLE, for diagnostic plotting
-        'smooth_x'       : x-grid of the fitted loess curve
-        'smooth_log_phi' : loess-smoothed log(phi) at smooth_x
-        'global_phi'     : fallback phi, unchanged from fit_nb_dispersion_trended
-        'discarded_bins' : [(log_center, phi)] excluded as boundary-hugging
-        'n_clono_used'   : number of clonotypes that passed the min_obs filter
-        'n_clono_total'  : total (patient, clono) groups considered
-    """
-    lo_bound, hi_bound = 1e-3, 1e6
-
-    lib = df.groupby(['patient', 'day'])[count_col].sum().rename('lib').reset_index()
-    df = df.merge(lib, on=['patient', 'day'], how='left')
-
-    clono_obs, mean_freqs = [], []
-    n_total = 0
-    for _, sub in df.groupby(['patient', 'clono']):
-        n_total += 1
-        n_nonzero = int((sub[count_col] > 0).sum())
-        if n_nonzero < min_obs:
-            continue
-        mu = _pooled_mu(sub, count_col)
-        x = sub[count_col].values.astype(float)
-        keep = mu > floor_mu
-        if keep.sum() < min_obs:
-            continue
-        total_lib = sub['lib'].sum()
-        mean_freq = sub[count_col].sum() / total_lib if total_lib > 0 else 0.0
-        if mean_freq <= 0:
-            continue
-        clono_obs.append((x[keep], mu[keep], mean_freq))
-        mean_freqs.append(mean_freq)
-
-    if not clono_obs:
-        raise ValueError("No clonotypes with enough observations to fit phi.")
-
-    mean_freqs = np.array(mean_freqs)
-    log_mf = np.log10(mean_freqs)
-    edges = np.unique(np.quantile(log_mf, np.linspace(0, 1, n_bins + 1)))
+    
+def phi_for_freq(model: dict, mean_freq: float) -> float:
+    """Look up trended dispersion phi for a given mean frequency."""
+    if mean_freq <= 0:
+        return model['global_phi']
+    edges = model['logfreq_edges']
     actual_bins = len(edges) - 1
-    bin_idx = np.clip(np.digitize(log_mf, edges[1:-1]), 0, actual_bins - 1)
+    b = int(np.clip(np.digitize(np.log10(mean_freq), edges[1:-1]), 0, actual_bins - 1))
+    phi = model['phi_per_bin'][b]
+    return phi if phi is not None else model['global_phi']
 
-    bin_widths = np.diff(edges)
-    median_width = np.median(bin_widths)
-    max_width_ratio = 4.0
-    
-    x_all = np.concatenate([c[0] for c in clono_obs])
-    mu_all = np.concatenate([c[1] for c in clono_obs])
-    res = minimize_scalar(_nb_neg_loglik, args=(x_all, mu_all),
-                           bounds=(np.log(lo_bound), np.log(hi_bound)), method='bounded')
-    global_phi = float(np.exp(res.x))
-
-    reliable_centers, reliable_log_phi, discarded = [], [], []
-    for b in range(actual_bins):
-        members = [clono_obs[i] for i in range(len(clono_obs)) if bin_idx[i] == b]
-        if len(members) < min_bin_members:
-            continue
-        
-        if bin_widths[b] > max_width_ratio * median_width:
-            log_center = float(np.log10(np.mean([m[2] for m in members])))
-            discarded.append((log_center, None))  # None marks "too wide", not boundary-hugging
-            continue
-        
-        xb = np.concatenate([m[0] for m in members])
-        mub = np.concatenate([m[1] for m in members])
-        rb = minimize_scalar(_nb_neg_loglik, args=(xb, mub),
-                              bounds=(np.log(lo_bound), np.log(hi_bound)), method='bounded')
-        phi_b = float(np.exp(rb.x))
-        log_center = float(np.log10(np.mean([m[2] for m in members])))
-
-        if phi_b <= lo_bound * (1 + boundary_tol) or phi_b >= hi_bound * (1 - boundary_tol):
-            discarded.append((log_center, phi_b))
-            continue
-
-        reliable_centers.append(log_center)
-        reliable_log_phi.append(np.log(phi_b))
-
-    if len(reliable_centers) < 3:
-        raise ValueError(
-            "Fewer than 3 reliable bins after discarding boundary-hugging "
-            "estimates -- increase n_bins, raise floor_mu, or check data density."
-        )
-
-    reliable_centers = np.array(reliable_centers)
-    reliable_log_phi = np.array(reliable_log_phi)
-    smoothed = lowess(reliable_log_phi, reliable_centers,
-                       frac=lowess_frac, it=lowess_it, return_sorted=True)
-
-    return {
-        'bin_centers': reliable_centers,
-        'bin_log_phi': reliable_log_phi,
-        'smooth_x': smoothed[:, 0],
-        'smooth_log_phi': smoothed[:, 1],
-        'global_phi': global_phi,
-        'discarded_bins': discarded,
-        'n_clono_used': len(clono_obs),
-        'n_clono_total': n_total,
-    }
-    
-def pool_dispersion_trends_union(models: dict, n_grid: int = 100) -> dict:
-    """
-    Equal-weight pooling over the UNION of donors' ranges: each grid point
-    averages only over the donors whose fitted curve actually covers it,
-    rather than requiring all donors to cover the full range.
-    """
-    lo = min(m['smooth_x'].min() for m in models.values())
-    hi = max(m['smooth_x'].max() for m in models.values())
-    grid = np.linspace(lo, hi, n_grid)
-
-    curves = np.full((len(models), n_grid), np.nan)
-    for i, m in enumerate(models.values()):
-        in_range = (grid >= m['smooth_x'].min()) & (grid <= m['smooth_x'].max())
-        curves[i, in_range] = np.interp(grid[in_range], m['smooth_x'], m['smooth_log_phi'])
-
-    n_covering = np.sum(~np.isnan(curves), axis=0)
-    mean_curve = np.nanmean(curves, axis=0)
-
-    return {
-        'smooth_x': grid,
-        'smooth_log_phi': mean_curve,
-        'per_donor_log_phi': curves,   # NaN where a donor doesn't cover that x
-        'n_donors_covering': n_covering,  # how many donors informed each grid point
-        'global_phi': float(np.mean([m['global_phi'] for m in models.values()])),
-    }
