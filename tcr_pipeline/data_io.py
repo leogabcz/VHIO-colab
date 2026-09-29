@@ -15,8 +15,12 @@ count      : int   — raw count
 """
 
 import re
-import rpy2.robjects as ro
-from rpy2.robjects import pandas2ri
+try:  # R bridge is optional: only load_anonymized_rds needs it
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+except ImportError:
+    ro = None
+    pandas2ri = None
 import pandas as pd
 import rdata
 from typing import Optional
@@ -124,6 +128,11 @@ def load_anonymized_rds(path, min_frac=1e-6):
                    freq >= 1e-6
         lib_post : post-filter read sum, kept for comparison only
     """
+    if ro is None:
+        raise ImportError(
+            "load_anonymized_rds requires rpy2 and a working R installation."
+        )
+
     frames = []
 
     with (ro.default_converter + pandas2ri.converter).context():
