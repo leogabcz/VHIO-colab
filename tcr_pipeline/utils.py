@@ -299,3 +299,16 @@ def impute_trajectories(
     )
 
     return df_full.drop(columns='pseudocount').reset_index(drop=True)
+
+def grid_complete(df, count_col='count'):
+    frames = []
+    for patient, g in df.groupby('patient'):
+        days = g['day'].unique()
+        clonos = g['clono'].unique()
+        full_idx = pd.MultiIndex.from_product([[patient], days, clonos],
+                                               names=['patient', 'day', 'clono'])
+        g_full = (g.set_index(['patient', 'day', 'clono'])[count_col]
+                    .reindex(full_idx, fill_value=0)
+                    .reset_index())
+        frames.append(g_full)
+    return pd.concat(frames, ignore_index=True)

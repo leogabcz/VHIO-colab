@@ -15,6 +15,8 @@ count      : int   — raw count
 """
 
 import re
+import rpy2.robjects as ro
+from rpy2.robjects import pandas2ri
 import pandas as pd
 import rdata
 from typing import Optional
@@ -113,6 +115,75 @@ def nested_dict_to_long(
 
     return long.sort_values(["patient", "day", "clono"]).reset_index(drop=True)
 
+def load_anonymized_rds(path, min_frac=1e-6):
+    """Load VHIO's anonymized RDS into long format.
+
+    Adds:
+        D_t      : pre-filter in-frame depth, recovered from freq_in
+        c_t      : read cutoff implied by the upstream filter
+                   freq >= 1e-6
+        lib_post : post-filter read sum, kept for comparison only
+    """
+    frames = []
+
+    with (ro.default_converter + pandas2ri.converter).context():
+        rds = ro.r['readRDS'](path)
+
+        donor_names = rds.names()
+
+        for i, donor in enumerate(donor_names):
+            tps = rds[i]
+
+            tp_names = tps.names()
+
+            for j, tp in enumerate(tp_names):
+                df = ro.conversion.get_conversion().rpy2py(tps[j])
+
+                df = df.assign(
+                    patient=donor,
+                    day=int(str(tp).lstrip('d'))
+                )
+
+                frames.append(
+                    df[['patient', 'day', 'clono', 'count', 'freq_in']]
+                )
+
+    d = pd.concat(frames, ignore_index=True)
+
+    d['count'] = d['count'].astype(int)
+
+    g = [d['patient'], d['day']]
+
+    # Recover the pre-filter sequencing depth.
+    # freq_in is expressed as a percentage.
+    d['D_t'] = (
+        (d['count'] * 100 / d['freq_in'])
+        .groupby(g)
+        .transform('median')
+    )
+
+    # Read cutoff implied by freq >= min_frac.
+    d['c_t'] = np.ceil(min_frac * d['D_t'] - 1e-6)
+
+    # Sum of reads remaining after the upstream filtering.
+    d['lib_post'] = (
+        d.groupby(['patient', 'day'])['count']
+        .transform('sum')
+    )
+
+    # Check that the inferred cutoff agrees with the minimum
+    # observed count in each patient/day.
+    chk = d.groupby(['patient', 'day']).agg(
+        c_t=('c_t', 'first'),
+        obs_min=('count', 'min')
+    )
+
+    bad = chk[chk['c_t'] != chk['obs_min']]
+
+    if len(bad):
+        print("WARNING cutoff mismatch:\n", bad)
+
+    return d
 
 def long_df_to_wide(
     data: pd.DataFrame,

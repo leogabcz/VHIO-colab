@@ -154,51 +154,64 @@ def tmm_normalize(
     trim_m: float = 0.3,
     trim_a: float = 0.05,
     factor_col: str = "tmm_factor",
+    lib_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Compute TMM (Trimmed Mean of M-values) normalization factors within each
     patient, using that patient's timepoints as the set of samples.
 
     Each timepoint's factor is computed relative to a reference timepoint
-    (the one whose total count is closest to the mean across all timepoints
-    of that patient). The reference timepoint gets factor = 1.0.
+    (the one whose library size is closest to the patient's mean). The
+    reference timepoint gets factor = 1.0.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Canonical long-format DataFrame with columns: patient, day, clono, count.
+        Long-format DataFrame with columns: patient, day, clono, count
+        (plus `lib_col` if given).
     trim_m : float
-        Fraction of features to trim from each tail of the M-value
-        (log-ratio) distribution. Default 0.3 (30% each tail, as in edgeR).
+        Fraction trimmed from each tail of the M-value distribution. Default 0.3.
     trim_a : float
-        Fraction of features to trim from each tail of the A-value
-        (mean log-count) distribution. Default 0.05.
+        Fraction trimmed from each tail of the A-value distribution. Default 0.05.
     factor_col : str
-        Name of the new column added to hold the raw TMM factor.
+        Name of the output column holding the raw TMM factor.
+    lib_col : str, optional
+        Column holding each sample's library size (constant within a
+        (patient, day) sample), e.g. 'D_t', the true pre-filter depth.
+        If None, library size is the sum of the counts present, which for
+        SEQTR data is the POST-filter sum and understates depth by 3.5-12.5%.
 
     Returns
     -------
     pd.DataFrame
-        Copy of the input with an additional column `factor_col`, the raw
-        per-(patient, day) multiplicative correction factor (centered near
-        1). This is the correction factor itself — NOT a normalized count —
-        and is what should be passed to _attach_lib's `norm_factors`, used
-        as `lib = raw_lib * factor`. It must be multiplied onto raw library
-        size, never used to divide or rescale counts directly.
-
-    References
-    ----------
-    Robinson, M.D. & Oshlack, A. (2010). A scaling normalization method for
-    differential expression analysis of RNA-seq data. Genome Biology, 11, R25.
+        Copy of the input with `factor_col` added: the raw per-(patient, day)
+        multiplicative correction (centred near 1). Use it as
+        lib = D_t * factor (see nb_glm_v2.attach_offset); never divide counts by it.
     """
     result = df.copy()
     result[factor_col] = np.nan
 
+    if lib_col is not None:
+        if lib_col not in result.columns:
+            raise KeyError(f"lib_col '{lib_col}' not in DataFrame")
+        n_unique = result.groupby(["patient", "day"])[lib_col].nunique()
+        if (n_unique > 1).any():
+            raise ValueError(f"'{lib_col}' is not constant within (patient, day) samples")
+
     for patient, patient_df in result.groupby("patient"):
         pivot = patient_df.pivot_table(
-            index="clono", columns="day", values="count", fill_value=0
+            index="clono", columns="day", values="count",
+            aggfunc="sum", fill_value=0
         )
-        lib_sizes = pivot.sum(axis=0)
+
+        if lib_col is None:
+            lib_sizes = pivot.sum(axis=0)
+        else:
+            lib_sizes = (patient_df.groupby("day")[lib_col].first()
+                         .reindex(pivot.columns).astype(float))
+            if lib_sizes.isna().any():
+                raise ValueError(f"missing {lib_col} for some days of patient {patient}")
+
         mean_lib = lib_sizes.mean()
         ref_day = (lib_sizes - mean_lib).abs().idxmin()
 
@@ -207,9 +220,9 @@ def tmm_normalize(
             if day == ref_day:
                 norm_factors[day] = 1.0
                 continue
-            counts_t   = pivot[day].values.astype(float)
+            counts_t = pivot[day].values.astype(float)
             counts_ref = pivot[ref_day].values.astype(float)
-            lib_t   = lib_sizes[day]
+            lib_t = lib_sizes[day]
             lib_ref = lib_sizes[ref_day]
 
             keep = (counts_t > 0) & (counts_ref > 0)

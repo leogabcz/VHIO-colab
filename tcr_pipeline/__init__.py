@@ -10,4 +10,4 @@ normalization   : library-size correction, CLR normalization and TMM normalizati
 clustering      : cluster non-neutral clonotype trajectories
 """
 
-from tcr_pipeline import data_io, normalization, visualization, noise_model, statistics, utils, edgeR_wrapper
+from tcr_pipeline import data_io, normalization, visualization, noise_model, statistics, utils, edgeR_wrapper, nb_glm, nb_glm_legacy
