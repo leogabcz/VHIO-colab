@@ -136,46 +136,157 @@ def add_qvalues(res: pd.DataFrame, p_col: str = 'p_value',
 # Dispersion: Cox-Reid, detected timepoints only, identifiable clones only
 # =============================================================================
 
-def _nb_neg_loglik_cr(log_phi: float, x: np.ndarray, mu: np.ndarray,
-                      starts: np.ndarray) -> float:
-    """Cox-Reid adjusted NB negative log-likelihood.
-
-    x, mu are concatenated over clones; ``starts`` gives each clone's first index.
-    For an intercept-only log-link NB with offset, the information for the mean
-    is sum_t w_ct with w_ct = mu_ct * phi / (phi + mu_ct); CR subtracts
-    0.5 * log of it per clone.
+# =============================================================================
+# Dispersion: Cox-Reid, detected timepoints only, identifiable clones only
+# =============================================================================
+#
+# Model (healthy donors, neutral):
+#     x_ct ~ NB(mu_ct, phi),   mu_ct = L_t * lambda_c   (L_t = D_t * tmm_factor)
+# A count is observed only if x_ct >= c_t, the per-sample detection threshold
+# (c_t = ceil(cutoff_frac * D_t) for this data). Only detected rows are used, so
+# each is modelled with the NB truncated at c_t, i.e. conditional on the clone's
+# detection pattern. This makes the min_detect selection ignorable.
+#
+# For each trial phi, every clone's lambda_c is re-solved by Fisher scoring
+# (true profile likelihood), and the Cox-Reid term uses the (truncated) Fisher
+# information for log(lambda_c):
+#     I_c = sum_t w_ct^2 Var(X | X >= c_t),   w_ct = phi / (phi + mu_ct)
+# which reduces to sum_t mu_ct * phi / (phi + mu_ct) without truncation.
+#
+# Requires module-level PHI_BOUNDS (bounds on log phi), CUTOFF_FRAC, KEYS
+# (['patient', 'clono', 'day']), and `from scipy.optimize import minimize_scalar`.
+ 
+ 
+def _trunc_moments(mu: np.ndarray, phi: float, c: np.ndarray):
+    """Mean, variance and tail probability of X | X >= c, X ~ NB(mu, phi) (size phi).
+ 
+    c is an integer array (>= 1), one threshold per row. Uses the pmf recurrence
+    P(k) = P(k-1) * (k - 1 + phi) / k * mu / (phi + mu).
+    """
+    p = phi / (phi + mu)
+    q = mu / (phi + mu)
+    pk = np.exp(phi * np.log(p))                 # P(X = 0)
+    s1 = np.zeros_like(mu)
+    s2 = np.zeros_like(mu)
+    for k in range(1, int(c.max())):             # k = 0 adds nothing to s1, s2
+        pk = pk * (k - 1 + phi) / k * q
+        below = k < c
+        s1 += np.where(below, k * pk, 0.0)
+        s2 += np.where(below, k * k * pk, 0.0)
+    tail = np.maximum(stats.nbinom.sf(c - 1, phi, p), 1e-300)   # P(X >= c)
+    ex = (mu - s1) / tail
+    ex2 = (mu + mu * mu / phi + mu * mu - s2) / tail
+    var = np.maximum(ex2 - ex * ex, 1e-12)
+    return ex, var, tail
+ 
+ 
+def _nb_mu_given_phi(x: np.ndarray, L: np.ndarray, starts: np.ndarray,
+                     n_per: np.ndarray, phi: float, lam0: np.ndarray,
+                     c: Optional[np.ndarray] = None,
+                     max_iter: int = 25, tol: float = 1e-8, max_step: float = 2.0):
+    """NB MLE of each clone's log-frequency at fixed phi, optionally truncated at c.
+ 
+    Fisher scoring on beta_c = log(lambda_c), warm-started at lam0 (pooled ratio).
+    Score: U_c = sum_t w_ct (x_ct - E[X_ct | X_ct >= c_t]),  w_ct = phi / (phi + mu_ct).
+    Info:  I_c = sum_t w_ct^2 Var(X_ct | X_ct >= c_t).
+    Without truncation these are the usual NB-GLM score and Fisher information.
+ 
+    Returns (mu, I, step_max): fitted means (concatenated over clones), per-clone
+    information at the fit, and the largest final step (convergence check).
+    """
+    def moments(mu):
+        if c is None:
+            return mu, mu * (phi + mu) / phi
+        ex, var, _ = _trunc_moments(mu, phi, c)
+        return ex, var
+ 
+    beta = np.log(lam0)
+    step_max = np.inf
+    for _ in range(max_iter):
+        mu = np.repeat(np.exp(beta), n_per) * L
+        w = phi / (phi + mu)
+        ex, var = moments(mu)
+        U = np.add.reduceat(w * (x - ex), starts)
+        I = np.add.reduceat(w * w * var, starts)
+        step = np.clip(U / I, -max_step, max_step)
+        beta = beta + step
+        step_max = float(np.max(np.abs(step)))
+        if step_max < tol:
+            break
+    mu = np.repeat(np.exp(beta), n_per) * L
+    w = phi / (phi + mu)
+    _, var = moments(mu)
+    I = np.add.reduceat(w * w * var, starts)
+    return mu, I, step_max
+ 
+ 
+def _nb_neg_loglik_cr(log_phi: float, x: np.ndarray, L: np.ndarray,
+                      starts: np.ndarray, n_per: np.ndarray, lam0: np.ndarray,
+                      resolve_mean: bool = True,
+                      c: Optional[np.ndarray] = None,
+                      cox_reid: bool = True) -> float:
+    """Cox-Reid adjusted (optionally truncated) NB negative profile log-likelihood.
+ 
+    resolve_mean=True : each clone's lambda_c is re-solved at this phi (true profile).
+    resolve_mean=False: the fixed pooled ratio lam0 is plugged in (plug-in approximation).
+    c                 : per-row detection threshold; None = no truncation.
+    cox_reid          : include the Cox-Reid term (False = plain profile likelihood).
     """
     phi = np.exp(log_phi)
+    if resolve_mean:
+        mu, I, _ = _nb_mu_given_phi(x, L, starts, n_per, phi, lam0, c)
+    else:
+        mu = np.repeat(lam0, n_per) * L
+        w = phi / (phi + mu)
+        var = mu * (phi + mu) / phi if c is None else _trunc_moments(mu, phi, c)[1]
+        I = np.add.reduceat(w * w * var, starts)
     p = phi / (phi + mu)
-    ll = stats.nbinom.logpmf(x, phi, p).sum()
-    return -(ll - 0.5 * np.log(np.add.reduceat(mu * p, starts)).sum())
-
-
-def _fit_phi(x, mu, starts):
-    res = minimize_scalar(_nb_neg_loglik_cr, args=(x, mu, starts),
+    ll = stats.nbinom.logpmf(x, phi, p)
+    if c is not None:
+        ll = ll - stats.nbinom.logsf(c - 1, phi, p)
+    penalty = 0.5 * np.log(I).sum() if cox_reid else 0.0
+    return -(ll.sum() - penalty)
+ 
+ 
+def _fit_phi(x, L, starts, n_per, lam0, resolve_mean: bool = True,
+             c: Optional[np.ndarray] = None, cox_reid: bool = True):
+    res = minimize_scalar(_nb_neg_loglik_cr,
+                          args=(x, L, starts, n_per, lam0, resolve_mean, c, cox_reid),
                           bounds=PHI_BOUNDS, method='bounded')
+    phi = float(np.exp(res.x))
     at_bound = (np.isclose(res.x, PHI_BOUNDS[0], atol=1e-3)
                 or np.isclose(res.x, PHI_BOUNDS[1], atol=1e-3))
-    return float(np.exp(res.x)), bool(at_bound)
-
-
-def _sparse_blocks(df, count_col, lib_col, depth_col, min_detect):
-    """Detected rows only, one row per (patient, clono, day), clone-contiguous."""
-    cols = list(dict.fromkeys([lib_col, depth_col]))
-    agg = {count_col: 'sum', **{c: 'first' for c in cols}}
+    if resolve_mean:
+        _, _, step_max = _nb_mu_given_phi(x, L, starts, n_per, phi, lam0, c)
+        if step_max > 1e-6:
+            warnings.warn(f"inner NB mean fit not converged at phi={phi:.3g} "
+                          f"(max step {step_max:.2e})")
+    return phi, bool(at_bound)
+ 
+ 
+def _sparse_blocks(df, count_col, lib_col, depth_col, min_detect, c_col=None):
+    """Detected rows only, one row per (patient, clono, day), clone-contiguous.
+ 
+    Returns x, L, D, starts, n_per, c (c is None when c_col is None).
+    """
+    cols = list(dict.fromkeys([lib_col, depth_col] + ([c_col] if c_col else [])))
+    agg = {count_col: 'sum', **{col: 'first' for col in cols}}
     d = (df[df[count_col] > 0]
          .groupby(KEYS, as_index=False, sort=True).agg(agg))
     d['n_det'] = d.groupby(['patient', 'clono'])['day'].transform('size')
     d = d[d['n_det'] >= min_detect].reset_index(drop=True)
     if len(d) == 0:
-        return (np.array([]),) * 3 + (np.array([], int),) * 2
+        return (np.array([]),) * 3 + (np.array([], int),) * 2 + (None,)
+    if c_col and (d[count_col] < d[c_col]).any():
+        raise ValueError("detected counts below the per-sample threshold c: check c_col")
     key = d['patient'].astype(str) + '|' + d['clono'].astype(str)
     starts = np.flatnonzero((key != key.shift()).values)
     n_per = np.diff(np.append(starts, len(d)))
+    c = d[c_col].to_numpy(int) if c_col else None
     return (d[count_col].to_numpy(float), d[lib_col].to_numpy(float),
-            d[depth_col].to_numpy(float), starts, n_per)
-
-
+            d[depth_col].to_numpy(float), starts, n_per, c)
+ 
+ 
 def fit_nb_dispersion_cr(df: pd.DataFrame,
                          count_col: str = 'count',
                          lib_col: str = 'lib',
@@ -184,47 +295,61 @@ def fit_nb_dispersion_cr(df: pd.DataFrame,
                          min_freq_mult: float = 5.0,
                          cutoff_frac: float = CUTOFF_FRAC,
                          n_bins: int = 6,
-                         min_bin_clones: int = 50) -> dict:
-    """Shared NB dispersion from healthy donors (sparse, Cox-Reid, identifiable range).
-
+                         min_bin_clones: int = 50,
+                         resolve_mean: bool = True,
+                         truncate: bool = True,
+                         c_col: str = 'c',
+                         cox_reid: bool = True) -> dict:
+    """Shared NB dispersion from healthy donors (sparse, truncated, Cox-Reid).
+ 
     Parameters
     ----------
     df : long-format donor data, detected rows (sparse). Needs patient, day, clono,
-        count_col, lib_col (see ``attach_offset``) and depth_col.
-    min_detect : minimum detected timepoints per clone.
+        count_col, lib_col (see ``attach_offset``), depth_col and, if truncate,
+        c_col: the per-sample detection threshold (here ceil(cutoff_frac * D_t),
+        equal to the per-sample minimum detected count).
+    min_detect : minimum detected timepoints per clone. Ignorable under truncation.
     min_freq_mult : keep only clones whose pooled frequency (relative to D_t) is at
-        least ``min_freq_mult * cutoff_frac``. Calibrate by simulation: the smallest
-        value for which phi is recovered within ~5%.
+        least ``min_freq_mult * cutoff_frac``. Calibrate by simulation.
     n_bins : quantile bins over the retained frequency range, reported to check that
         a single phi is justified (flat per-bin estimates).
-
+    resolve_mean : re-solve each clone's mean at every trial phi (true profile).
+        False plugs in the fixed pooled ratio (previous behaviour).
+    truncate : model detected counts as NB truncated at c (conditional on detection).
+        False uses the untruncated pmf (previous behaviour).
+    c_col : column holding the per-sample detection threshold.
+    cox_reid : include the Cox-Reid adjustment (False = plain profile, for comparison).
+ 
     Returns
     -------
     dict with 'phi', 'phi_at_bound', 'n_clones', 'n_obs', 'bins' (DataFrame), and the
     settings used, for provenance.
     """
-    _require(df, ['patient', 'day', 'clono', count_col, lib_col, depth_col])
-    x, L, Dd, starts, n_per = _sparse_blocks(df, count_col, lib_col, depth_col, min_detect)
+    _require(df, ['patient', 'day', 'clono', count_col, lib_col, depth_col]
+             + ([c_col] if truncate else []))
+    x, L, Dd, starts, n_per, c = _sparse_blocks(
+        df, count_col, lib_col, depth_col, min_detect, c_col if truncate else None)
     if len(n_per) == 0:
         raise ValueError("no clones with enough detections")
-
+ 
     sx = np.add.reduceat(x, starts)
-    p_hat = sx / np.add.reduceat(L, starts)          # frequency on the offset scale
+    p_hat = sx / np.add.reduceat(L, starts)          # warm start, offset scale
     p_depth = sx / np.add.reduceat(Dd, starts)       # frequency relative to true depth
     keep = p_depth >= min_freq_mult * cutoff_frac
     if not keep.any():
         raise ValueError("no clones above min_freq_mult * cutoff")
-
+ 
     obs = np.repeat(keep, n_per)
     x, L = x[obs], L[obs]
+    if c is not None:
+        c = c[obs]
     n_per, p_hat, p_depth = n_per[keep], p_hat[keep], p_depth[keep]
     starts = np.concatenate([[0], np.cumsum(n_per)[:-1]])
-    mu = np.repeat(p_hat, n_per) * L
-
-    phi, at_bound = _fit_phi(x, mu, starts)
+ 
+    phi, at_bound = _fit_phi(x, L, starts, n_per, p_hat, resolve_mean, c, cox_reid)
     if at_bound:
         warnings.warn("global phi hit the search bound: not identifiable in this subset")
-
+ 
     lp = np.log10(p_depth)
     edges = np.unique(np.quantile(lp, np.linspace(0, 1, n_bins + 1)))
     b_of = np.clip(np.digitize(lp, edges[1:-1]), 0, len(edges) - 2)
@@ -237,14 +362,18 @@ def fit_nb_dispersion_cr(df: pd.DataFrame,
             o = np.repeat(m, n_per)
             npb = n_per[m]
             sb = np.concatenate([[0], np.cumsum(npb)[:-1]])
-            row['phi'], row['at_bound'] = _fit_phi(x[o], mu[o], sb)
+            row['phi'], row['at_bound'] = _fit_phi(
+                x[o], L[o], sb, npb, p_hat[m], resolve_mean,
+                None if c is None else c[o], cox_reid)
         rows.append(row)
-
+ 
     return {'phi': phi, 'phi_at_bound': at_bound,
             'n_clones': int(keep.sum()), 'n_obs': int(len(x)),
             'bins': pd.DataFrame(rows),
             'settings': dict(min_detect=min_detect, min_freq_mult=min_freq_mult,
-                             cutoff_frac=cutoff_frac, lib_col=lib_col)}
+                             cutoff_frac=cutoff_frac, lib_col=lib_col,
+                             resolve_mean=resolve_mean, truncate=truncate,
+                             c_col=c_col, cox_reid=cox_reid)}
 
 
 # =============================================================================
@@ -495,3 +624,4 @@ def mean_variance_decomposition(df: pd.DataFrame,
                         'C_eff_if_equal': 2 / a if a > 0 else np.nan,
                         'phi_from_quadratic': 2 / bq if bq > 0 else np.nan})
     return pd.DataFrame(out)
+

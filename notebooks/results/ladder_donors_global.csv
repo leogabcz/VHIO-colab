@@ -1,0 +1,6 @@
+step,phi,change_vs_prev_%,n_clones,seconds
+S0 legacy,4.011,,271720,
+"S1 sparse, no corrections",3.042,-24.2,129818,4.2
+S2 + Cox-Reid,2.074,-31.8,129818,4.7
+S3 + exact NB mean,2.119,2.2,129818,7.9
+S4 + truncation (new),1.586,-25.1,129818,82.3
