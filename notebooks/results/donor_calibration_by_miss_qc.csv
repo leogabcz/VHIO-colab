@@ -1,0 +1,11 @@
+held_out,miss_group,rejection_rate,n
+HD106_SEQTR,all detected,0.05,10692
+HD106_SEQTR,has misses,0.082,11997
+HD197_SEQTR,all detected,0.029,15980
+HD197_SEQTR,has misses,0.069,14007
+HDBR01_SEQTR_ReSeq,all detected,0.096,4643
+HDBR01_SEQTR_ReSeq,has misses,0.119,7515
+HDBR02_SEQTR_ReSeq,all detected,0.04,10198
+HDBR03_SEQTR_ReSeq,all detected,0.068,8919
+HDBR03_SEQTR_ReSeq,has misses,0.105,23011
+HDBR06_SEQTR_ReSeq,all detected,0.119,6753

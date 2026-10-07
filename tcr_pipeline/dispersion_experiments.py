@@ -472,3 +472,167 @@ def save_ladder_report(lad, path_prefix='ladder', title=None, n_cuts=8, logy=Tru
         files[name] = f'{prefix}_{name}.csv'
         t.to_csv(files[name], index=name in ('bins_S1S4', 'bins_by_freq'))
     return {'fig': fig, 'tables': tabs, 'files': files}
+
+
+# -----------------------------------------------------------------------------
+# Miss calibration: are non-detections as frequent as the NB model predicts?
+# -----------------------------------------------------------------------------
+
+def _pb_pmf_rows(q):
+    """Poisson-binomial pmf of the number of detections, row-wise.
+    q: (n, T) detection probabilities -> (n, T+1) pmf."""
+    n, T = q.shape
+    pmf = np.zeros((n, T + 1))
+    pmf[:, 0] = 1.0
+    for t in range(T):
+        qt = q[:, t:t + 1]
+        new = pmf * (1 - qt)
+        new[:, 1:] += pmf[:, :-1] * qt
+        pmf = new
+    return pmf
+
+
+def miss_calibration(nb, df, phi, min_detect=2, mean_method='truncated',
+                     drop_samples=None, donor_col='patient', count_col='count',
+                     lib_col='lib', depth_col='D_t', c_col='c'):
+    """Observed vs predicted non-detections for every tested clone x sampled day.
+
+    For each clone with >= min_detect detections (set min_detect to the trajectory
+    test's own clone filter), lambda_c is estimated from its DETECTED counts only:
+    'truncated' = NB MLE truncated at c_t (default), 'ratio' = pooled ratio. The
+    misses never inform lambda, so the comparison asks: given what was detected, how
+    often should this clone have been missed under the neutral NB model?
+
+    The predicted miss probability at day t is conditioned on the clone passing the
+    min_detect selection (Poisson-binomial over the donor's sampled days):
+        P(miss_t | N >= k) = (1 - q_t) P(N_{-t} >= k) / P(N >= k),
+        q_t = P(X_t >= c_t | L_t * lambda_c, phi).
+
+    phi          : float, or dict {donor: phi} (e.g. each donor's own phi).
+    drop_samples : list of (donor, day) to remove first, as if never sampled
+                   (e.g. a failed library).
+
+    Returns one row per (clone, sampled day) with: missed (0/1), p_miss (conditional
+    on selection), p_miss_raw (unconditional), mu_over_c, log10_freq (pooled observed
+    frequency over detected rows), n_det, n_days, and position flags for the day.
+    """
+    d = df
+    if drop_samples:
+        drop = pd.MultiIndex.from_tuples(drop_samples)
+        d = d[~pd.MultiIndex.from_arrays([d[donor_col], d['day']]).isin(drop)]
+    det = (d[d[count_col] > 0]
+           .groupby([donor_col, 'clono', 'day'], as_index=False, sort=True)
+           .agg({count_col: 'sum', lib_col: 'first', depth_col: 'first', c_col: 'first'}))
+    det['n_det'] = det.groupby([donor_col, 'clono'])['day'].transform('size')
+    det = det[det['n_det'] >= min_detect].reset_index(drop=True)
+
+    samples = (d.groupby([donor_col, 'day'], as_index=False)
+                 .agg({lib_col: 'first', depth_col: 'first', c_col: 'first'})
+                 .sort_values([donor_col, 'day']))
+    out = []
+    for pat, s in samples.groupby(donor_col):
+        sub = det[det[donor_col] == pat]
+        if len(sub) == 0:
+            continue
+        ph = phi[pat] if isinstance(phi, dict) else phi
+        days = s['day'].to_numpy()
+        T = len(days)
+
+        x = sub[count_col].to_numpy(float)
+        L = sub[lib_col].to_numpy(float)
+        c = sub[c_col].to_numpy(int)
+        key = sub['clono'].to_numpy()
+        starts = np.flatnonzero(np.r_[True, key[1:] != key[:-1]])
+        n_per = np.diff(np.r_[starts, len(key)])
+        lam0 = np.add.reduceat(x, starts) / np.add.reduceat(L, starts)
+        if mean_method == 'truncated':
+            with np.errstate(all='ignore'):
+                mu, _, _ = nb._nb_mu_given_phi(x, L, starts, n_per, ph, lam0, c)
+            lam = mu[starts] / L[starts]
+        else:
+            lam = lam0
+        freq = np.add.reduceat(x, starts) / np.add.reduceat(sub[depth_col].to_numpy(float), starts)
+
+        clones = key[starts]
+        Ls = s[lib_col].to_numpy(float)
+        cs = s[c_col].to_numpy(int)
+        mu_ct = lam[:, None] * Ls[None, :]                       # (n_clones, T)
+        q = stats.nbinom.sf(cs[None, :] - 1, ph, ph / (ph + mu_ct))   # P(detect)
+
+        p_sel = _pb_pmf_rows(q)[:, min_detect:].sum(1)
+        p_miss = np.empty_like(q)
+        for t in range(T):
+            others = np.delete(q, t, axis=1)
+            p_miss[:, t] = (1 - q[:, t]) * _pb_pmf_rows(others)[:, min_detect:].sum(1)
+        p_miss = p_miss / np.maximum(p_sel, 1e-300)[:, None]
+
+        detected = np.zeros((len(clones), T), bool)
+        ci = np.repeat(np.arange(len(clones)), n_per)
+        ti = np.searchsorted(days, sub['day'].to_numpy())
+        detected[ci, ti] = True
+
+        out.append(pd.DataFrame({
+            donor_col: pat,
+            'clono': np.repeat(clones, T),
+            'day': np.tile(days, len(clones)),
+            'day_index': np.tile(np.arange(T), len(clones)),
+            'n_days': T,
+            'missed': (~detected).ravel().astype(int),
+            'p_miss': p_miss.ravel(),
+            'p_miss_raw': (1 - q).ravel(),
+            'mu_over_c': (mu_ct / cs[None, :]).ravel(),
+            'log10_freq': np.repeat(np.log10(freq), T),
+            'n_det': np.repeat(n_per, T),
+        }))
+    cal = pd.concat(out, ignore_index=True)
+    cal['edge_day'] = (cal['day_index'] == 0) | (cal['day_index'] == cal['n_days'] - 1)
+    return cal
+
+
+def summarise_miss_calibration(cal, by=('patient',), n_freq_bins=6):
+    """Observed vs expected misses per group.
+
+    by : columns to group by; may include 'freq_bin' (quantile bins of log10_freq,
+         pooled over donors), 'day', 'edge_day'.
+    Columns: n (clone-days), observed, expected, O/E, z = (O - E)/sqrt(sum p(1-p)),
+    and pi_excess = (O - E)/(n - E): the excess-miss probability pi in
+    P(miss) = pi + (1 - pi) P_NB(miss) that would match the observed rate (approximate,
+    since the expectation is conditioned on selection).
+    """
+    c = cal.copy()
+    by = list(by)
+    if 'freq_bin' in by:
+        c['freq_bin'] = pd.qcut(c['log10_freq'], n_freq_bins, duplicates='drop')
+    c['_var'] = c['p_miss'] * (1 - c['p_miss'])
+    g = c.groupby(by, observed=True).agg(n=('missed', 'size'), observed=('missed', 'sum'),
+                                         expected=('p_miss', 'sum'), _var=('_var', 'sum'))
+    g['O/E'] = g['observed'] / g['expected']
+    g['z'] = (g['observed'] - g['expected']) / np.sqrt(g['_var'])
+    g['pi_excess'] = (g['observed'] - g['expected']) / (g['n'] - g['expected'])
+    return g.drop(columns='_var').round({'expected': 1, 'O/E': 3, 'z': 1, 'pi_excess': 4})
+
+
+def plot_miss_calibration(cal, n_freq_bins=6, donor_col='patient', path=None):
+    """O/E of misses against abundance (left) and per sample (right), one line per donor."""
+    import matplotlib.pyplot as plt
+    fb = summarise_miss_calibration(cal, by=(donor_col, 'freq_bin'), n_freq_bins=n_freq_bins)
+    sd = summarise_miss_calibration(cal, by=(donor_col, 'day_index'))
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.5))
+    for pat, g in fb.groupby(level=0):
+        mids = [iv.mid for iv in g.index.get_level_values(1)]
+        a1.plot(mids, g['O/E'].to_numpy(), marker='o', label=pat)
+    for pat, g in sd.groupby(level=0):
+        a2.plot(g.index.get_level_values(1), g['O/E'].to_numpy(), marker='o', label=pat)
+    for ax in (a1, a2):
+        ax.axhline(1, color='k', lw=0.8)
+        ax.set_yscale('log')
+        ax.set_ylabel('observed / expected misses')
+    a1.set_xlabel('log10 frequency (bin mid-point)')
+    a2.set_xlabel('sample (index within donor, 0 = first)')
+    a1.set_title('Miss calibration by abundance', fontsize=10)
+    a2.set_title('Miss calibration by sample', fontsize=10)
+    a2.legend(fontsize=7)
+    fig.tight_layout()
+    if path:
+        fig.savefig(path, dpi=150, bbox_inches='tight')
+    return fig
