@@ -10,7 +10,7 @@ normalization   : library-size correction, CLR normalization and TMM normalizati
 clustering      : cluster non-neutral clonotype trajectories
 """
 
-from tcr_pipeline import data_io, nb_glm_old, normalization, visualization, noise_model, statistics, utils, nb_glm_legacy
+from tcr_pipeline import data_io, nb_glm_old, normalization, visualization, noise_model, statistics, utils, nb_glm_legacy, nb_glm
 
 try:  # needs rpy2 + R + edgeR; only used for cross-checking against real edgeR
     from tcr_pipeline import edgeR_wrapper
