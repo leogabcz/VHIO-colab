@@ -392,7 +392,7 @@ def load_noise_model(path: str) -> dict:
         "fit_distribution": payload.get("fit_distribution", "normal"),
     }
 
-def sample_qc(df, anchor_freq=1e-5, count_col='count', min_fails_to_drop=2):
+def sample_qc(df, count_col='count', min_fails_to_drop=2):
     """Per-sample QC metrics, each relative to the same person's other samples.
 
     Columns *_rel = value / median of the person's OTHER samples.
@@ -407,17 +407,12 @@ def sample_qc(df, anchor_freq=1e-5, count_col='count', min_fails_to_drop=2):
                  .pivot_table(index='clono', columns='day', values='f', fill_value=0))
         for day in days:
             gd = g[g['day'] == day]
-            others = [x for x in days if x != day]
-            anchors = freq.index[(freq[others] > 0).all(axis=1) &
-                                 (freq[others].mean(axis=1) >= anchor_freq)]
             rows.append({'patient': pat, 'day': day, 'D_t': gd['D_t'].iloc[0],
                          'n_clones': len(gd),
                          'reads_per_clone': gd[count_col].sum() / len(gd),
-                         'top_share': gd[count_col].max() / gd[count_col].sum(),
-                         'recapture': (freq.loc[anchors, day] > 0).mean() if len(anchors) else np.nan,
-                         'n_anchors': len(anchors)})
+                         'top_share': gd[count_col].max() / gd[count_col].sum()})
     q = pd.DataFrame(rows)
-    for col in ['n_clones', 'reads_per_clone', 'top_share', 'recapture']:
+    for col in ['n_clones', 'reads_per_clone', 'top_share']:
         q[col + '_rel'] = [
             v / q.loc[(q['patient'] == p) & (q['day'] != dd), col].median()
             for p, dd, v in zip(q['patient'], q['day'], q[col])]
@@ -425,8 +420,7 @@ def sample_qc(df, anchor_freq=1e-5, count_col='count', min_fails_to_drop=2):
     q['fail_clones']    = q['n_clones_rel'] < 0.2
     q['fail_top']       = q['top_share_rel'] > 5
     q['fail_rpc']       = q['reads_per_clone_rel'] > 5
-    q['fail_recapture'] = q['recapture_rel'] < 0.6
-    fail_cols = ['fail_clones', 'fail_top', 'fail_rpc', 'fail_recapture']
+    fail_cols = ['fail_clones', 'fail_top', 'fail_rpc']
     q['n_fails'] = q[fail_cols].sum(axis=1)
     q['drop'] = q['n_fails'] >= min_fails_to_drop
     q['review'] = q['n_fails'] == 1
