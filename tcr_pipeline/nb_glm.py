@@ -384,6 +384,9 @@ def _phi_vector(phi, patient, days, time_col: str = 'day') -> np.ndarray:
     time_col and phi (e.g. from ``conservative_phi``).
     """
     days = np.asarray(days)
+    if isinstance(phi, PhiTrend):
+        raise TypeError("a frequency-dependent PhiTrend is not supported here; pass a "
+                        "scalar or per-sample phi")
     if isinstance(phi, pd.DataFrame):
         m = (phi[phi['patient'] == patient].set_index(time_col)['phi']
              .reindex(days).to_numpy(float))
@@ -502,11 +505,88 @@ def _traj_fit_one(x, det, L, c, t_s, span, phi, beta_bound, likelihood, N=None):
     return b_hat / span, se_b / span, lr, pval, converged, at_bound
 
 
-def _traj_run_tasks(tasks, n_jobs=1):
+def _traj_fit_quad(x, det, L, c, t_s, span, phi, beta_bound, likelihood, N=None,
+                   shape_min_logfold=np.log(2)):
+    """Fit one clone with a quadratic trajectory: full (alpha, b1, b2) vs null (alpha).
+
+    log mu_t = log L_t + alpha + b1 * s_t + b2 * q_t,  s_t = (t - mean) / span,
+    q_t = s_t^2 - mean(s^2) (centred, so b1 keeps its meaning as the overall trend).
+    Bounds: |b1| <= beta_bound; |b2| * range(q) <= beta_bound (the curvature alone can
+    move the curve by at most beta_bound in log). LRT on 2 df.
+
+    Shape of the fitted curve over the sampled days:
+      'peak' : interior maximum at least shape_min_logfold above both ends (rise and fall)
+      'dip'  : interior minimum at least shape_min_logfold below both ends
+      'up' / 'down' : otherwise, by the sign of last - first
+    peak_support: for peaks/dips, number of DETECTED timepoints whose observed log
+    frequency is within log(2) of the observed extreme (>= 2: the excursion is carried
+    by more than one sample; 1: a single sample, lower confidence).
+
+    Returns (beta1 per unit time, beta2, LR, p_value, converged, at_bound, shape,
+    extreme_index, amplitude_logfold, peak_support).
+    """
+    if likelihood == 'dropout':
+        ll_fn = lambda mu, x_, d_, c_, ph: _traj_dropout_ll(mu, x_, d_, c_, ph, N, L)
+    else:
+        ll_fn = _TRAJ_LL[likelihood]
+    a0 = np.log(max(x[det].sum(), 1.0) / L[det].sum())
+    q_s = t_s ** 2 - np.mean(t_s ** 2)
+    b2_bound = beta_bound / max(np.ptp(q_s), 1e-12)
+
+    def nll(theta):
+        mu = L * np.exp(theta[0] + theta[1] * t_s + theta[2] * q_s)
+        v = -ll_fn(mu, x, det, c, phi).sum()
+        return v if np.isfinite(v) else 1e300
+
+    a_bounds = (a0 - 30.0, a0 + 30.0)
+    r0 = minimize_scalar(lambda a: nll((a, 0.0, 0.0)), bounds=a_bounds, method='bounded')
+    nll0 = r0.fun
+    best = None
+    starts = [(0.0, 0.0), (0.5 * beta_bound, 0.0), (-0.5 * beta_bound, 0.0),
+              (0.0, 0.5 * b2_bound), (0.0, -0.5 * b2_bound)]
+    for b1s, b2s in starts:
+        r = minimize(nll, x0=np.array([r0.x, b1s, b2s]), method='L-BFGS-B',
+                     bounds=[a_bounds, (-beta_bound, beta_bound), (-b2_bound, b2_bound)])
+        if best is None or r.fun < best.fun:
+            best = r
+    nll1 = min(best.fun, nll0)
+    lr = max(2.0 * (nll0 - nll1), 0.0)
+    pval = float(stats.chi2.sf(lr, 2))
+    _, b1, b2 = best.x
+    at_bound = bool(np.isclose(abs(b1), beta_bound, rtol=1e-3)
+                    or np.isclose(abs(b2), b2_bound, rtol=1e-3))
+    converged = bool(best.success or best.fun <= nll0) and np.isfinite(nll0)
+
+    f = b1 * t_s + b2 * q_s                          # fitted log-curve (relative)
+    kmax, kmin = int(np.argmax(f)), int(np.argmin(f))
+    interior = lambda k: 0 < k < len(f) - 1
+    rise = f[kmax] - max(f[0], f[-1])
+    fall = min(f[0], f[-1]) - f[kmin]
+    if interior(kmax) and rise >= shape_min_logfold and rise >= fall:
+        shape, k_ext = 'peak', kmax
+    elif interior(kmin) and fall >= shape_min_logfold:
+        shape, k_ext = 'dip', kmin
+    else:
+        shape, k_ext = ('up' if f[-1] > f[0] else 'down'), (len(f) - 1 if f[-1] > f[0] else 0)
+    amplitude = float(f.max() - f.min())
+
+    support = np.nan
+    if shape in ('peak', 'dip') and det.sum() > 0:
+        lf = np.full(len(x), np.nan)
+        lf[det] = np.log(x[det] / L[det])
+        if shape == 'peak':
+            support = int(np.sum(lf[det] >= np.nanmax(lf) - np.log(2)))
+        else:
+            support = int(np.sum(lf[det] <= np.nanmin(lf) + np.log(2)))
+    return (b1 / span, b2, lr, pval, converged, at_bound, shape, k_ext, amplitude, support)
+
+
+def _traj_run_tasks(tasks, n_jobs=1, fn=None):
+    fn = _traj_fit_one if fn is None else fn
     if n_jobs == 1:
-        return [_traj_fit_one(*t) for t in tasks]
+        return [fn(*t) for t in tasks]
     from joblib import Parallel, delayed
-    return Parallel(n_jobs=n_jobs)(delayed(_traj_fit_one)(*t) for t in tasks)
+    return Parallel(n_jobs=n_jobs)(delayed(fn)(*t) for t in tasks)
 
 
 def nb_trajectory_test(df: pd.DataFrame,
@@ -521,18 +601,28 @@ def nb_trajectory_test(df: pd.DataFrame,
                        dropout_N: Optional[pd.DataFrame] = None,
                        min_freq: Optional[float] = None,
                        depth_col: str = 'D_t',
+                       design: str = 'slope',
                        n_jobs: int = 1) -> pd.DataFrame:
-    """Per-clone NB slope test with a censored, truncated or dropout likelihood.
+    """Per-clone NB trajectory test with a censored, truncated or dropout likelihood.
 
     Each patient's clones are laid out over that patient's sampled timepoints.
-    H0: beta = 0 (constant frequency), tested by likelihood ratio on 1 df.
+    H0: constant frequency, tested by likelihood ratio against
+      design='slope'     : a log-linear trend (1 df), or
+      design='quadratic' : a log-quadratic trajectory (2 df), which also detects a single
+                           rise-and-fall ('peak') or fall-and-rise ('dip').
+    The quadratic design adds columns beta2, shape ('peak'/'dip'/'up'/'down', or
+    'failed'), at_bound (the fit reached beta_bound: typically a clone absent at one
+    end, i.e. emerging or disappearing; its amplitude is then a lower bound),
+    extreme_day, amplitude_fold (max/min of the fitted curve) and peak_support.
 
     Parameters
     ----------
     df : long-format, detected rows only (sparse is fine; the grid is built here).
         Needs patient, clono, time_col, count_col, lib_col, cutoff_col.
-    phi : float, the dict returned by ``fit_nb_dispersion_cr``, or a dict
-        {patient: phi} for per-patient values.
+    phi : float, the dict returned by ``fit_nb_dispersion_cr``, a dict
+        {patient: phi} for per-patient values, or a ``PhiTrend`` for a
+        frequency-dependent dispersion: each clone then uses phi(f_c), f_c = its
+        frequency over its detected samples (``clone_frequency``).
     likelihood : 'truncated' - only detected timepoints contribute, as
                      P(X = x | X >= c_t); misses carry no information (robust to dropout).
                  'censored'  - missing timepoints also contribute P(X <= c_t - 1).
@@ -572,7 +662,8 @@ def nb_trajectory_test(df: pd.DataFrame,
     frames = []
     for patient, g in df.groupby('patient'):
         days = np.sort(g[time_col].unique())
-        phi_p = _phi_vector(phi, patient, days, time_col)
+        trend = isinstance(phi, PhiTrend)
+        phi_p = None if trend else _phi_vector(phi, patient, days, time_col)
         dcols = [lib_col, cutoff_col] + ([depth_col] if depth_col in g.columns else [])
         per_day = g.groupby(time_col)[dcols].first().reindex(days)
         L = per_day[lib_col].to_numpy(float)
@@ -602,8 +693,35 @@ def nb_trajectory_test(df: pd.DataFrame,
             N = Np.reindex(days).to_numpy(float)
             if np.isnan(N).any():
                 raise ValueError(f"dropout_N lacks samples for {patient}")
-        tasks = [(X[i], DET[i], L, c, t_s, span, phi_p, beta_bound, likelihood, N)
+        if trend:                                     # one phi per clone, phi(f_c)
+            phi_clone = phi(clone_frequency(X, DET, Dd))
+            phi_rows = {i: np.full(len(days), phi_clone[i]) for i in sel}
+            phi_used = phi_clone[sel]
+        else:
+            phi_rows = {i: phi_p for i in sel}
+            phi_used = float(np.exp(np.mean(np.log(phi_p))))   # geometric mean over samples
+        tasks = [(X[i], DET[i], L, c, t_s, span, phi_rows[i], beta_bound, likelihood, N)
                  for i in sel]
+        if design == 'quadratic':
+            out = _traj_run_tasks(tasks, n_jobs, fn=_traj_fit_quad)
+            (beta, beta2, lr, pval, ok, atb, shape, k_ext, amp, supp) = map(np.array, zip(*out))
+            ok, atb = ok.astype(bool), atb.astype(bool)
+            fr = pd.DataFrame({
+                'patient': patient, 'clono': wide.index[sel],
+                'beta': beta.astype(float), 'beta2': beta2.astype(float),
+                'stat': lr.astype(float), 'p_value': pval.astype(float),
+                'n_detected': n_det[sel], 'n_timepoints': len(days),
+                'phi_used': phi_used,
+                'shape': np.where(~ok, 'failed', shape),
+                'at_bound': atb,
+                'extreme_day': days[k_ext.astype(int)],
+                'amplitude_fold': np.exp(amp.astype(float)),
+                'peak_support': supp.astype(float),
+                'converged': ok, 'likelihood': likelihood, 'design': design})
+            frames.append(fr)
+            continue
+        if design != 'slope':
+            raise ValueError("design must be 'slope' or 'quadratic'")
         out = _traj_run_tasks(tasks, n_jobs)
         beta, se, lr, pval, ok, atb = map(np.array, zip(*out))
 
@@ -615,13 +733,49 @@ def nb_trajectory_test(df: pd.DataFrame,
             'patient': patient, 'clono': wide.index[sel],
             'beta': beta, 'se_beta': se, 'stat': lr, 'p_value': pval,
             'n_detected': n_det[sel], 'n_timepoints': len(days),
-            'phi_used': float(np.exp(np.mean(np.log(phi_p)))),   # geometric mean over samples
+            'phi_used': phi_used,
             'direction': direction, 'converged': ok,
             'likelihood': likelihood}))
 
     if not frames:
         return pd.DataFrame(columns=cols)
+    if design == 'quadratic':
+        return pd.concat(frames, ignore_index=True)
     return pd.concat(frames, ignore_index=True)[cols]
+
+
+def nb_trajectory_combined(df: pd.DataFrame, phi, alpha: float = 0.05,
+                           **test_kwargs) -> pd.DataFrame:
+    """Slope and quadratic tests on the same clones, combined into one call per clone.
+
+    Runs ``nb_trajectory_test`` with design='slope' and design='quadratic' (same
+    arguments otherwise) and combines the two p-values per clone by Bonferroni min-p,
+        p_comb = min(1, 2 * min(p_slope, p_quad)),
+    which is valid whatever the dependence between the two tests. BH is then applied to
+    p_comb within each patient (q_comb); called = q_comb < alpha. This gives a single
+    FDR-controlled list of non-neutral clones that includes monotone trends (where the
+    1-df slope test is more powerful) and rise-and-fall / fall-and-rise clones (which the
+    slope test misses). The shape, extreme_day and amplitude come from the quadratic fit.
+
+    Returns one row per tested clone: patient, clono, n_detected, beta_slope, p_slope,
+    q_slope, direction (slope fit), p_quad, q_quad, shape, at_bound, extreme_day,
+    amplitude_fold, peak_support, p_comb, q_comb, called, phi_used.
+    """
+    rs = nb_trajectory_test(df, phi, design='slope', **test_kwargs)
+    rq = nb_trajectory_test(df, phi, design='quadratic', **test_kwargs)
+    rs = add_qvalues(rs, p_col='p_value', by='patient')
+    rq = add_qvalues(rq, p_col='p_value', by='patient')
+    m = (rs[['patient', 'clono', 'n_detected', 'beta', 'p_value', 'q_value', 'direction',
+             'phi_used']]
+         .rename(columns={'beta': 'beta_slope', 'p_value': 'p_slope', 'q_value': 'q_slope'})
+         .merge(rq[['patient', 'clono', 'p_value', 'q_value', 'shape', 'at_bound',
+                    'extreme_day', 'amplitude_fold', 'peak_support']]
+                .rename(columns={'p_value': 'p_quad', 'q_value': 'q_quad'}),
+                on=['patient', 'clono'], how='outer'))
+    m['p_comb'] = np.minimum(1.0, 2.0 * np.fmin(m['p_slope'], m['p_quad']))
+    m = add_qvalues(m, p_col='p_comb', by='patient', out_col='q_comb')
+    m['called'] = m['q_comb'] < alpha
+    return m
 
 
 def estimate_dropout_N(df: pd.DataFrame,
@@ -630,6 +784,7 @@ def estimate_dropout_N(df: pd.DataFrame,
                        lib_col: str = 'lib',
                        cutoff_col: str = 'c_t',
                        time_col: str = 'day',
+                       depth_col: str = 'D_t',
                        min_other: int = 2,
                        n_iter: int = 15,
                        flag_rel: float = 10.0,
@@ -659,10 +814,13 @@ def estimate_dropout_N(df: pd.DataFrame,
     rows = []
     for patient, g in df.groupby('patient'):
         days = np.sort(g[time_col].unique())
-        phi_v = _phi_vector(phi, patient, days, time_col)
-        per_day = g.groupby(time_col)[[lib_col, cutoff_col]].first().reindex(days)
+        trend = isinstance(phi, PhiTrend)
+        phi_v = None if trend else _phi_vector(phi, patient, days, time_col)
+        dcols = [lib_col, cutoff_col] + ([depth_col] if depth_col in g.columns else [])
+        per_day = g.groupby(time_col)[dcols].first().reindex(days)
         L = per_day[lib_col].to_numpy(float)
         c = per_day[cutoff_col].to_numpy(float)
+        Dd = per_day[depth_col].to_numpy(float) if depth_col in g.columns else L
         X = (g.pivot_table(index='clono', columns=time_col, values=count_col,
                            aggfunc='sum', fill_value=0)
                .reindex(columns=days, fill_value=0).to_numpy(float))
@@ -677,7 +835,11 @@ def estimate_dropout_N(df: pd.DataFrame,
             Lo, co = L[oth], c[oth]
             # truncated NB MLE of lambda from the other samples' detected counts
             lam = Xo.sum(1) / (Do * Lo).sum(1)
-            phi_o = phi_v[oth]
+            if trend:     # per-clone phi, from the frequency in the OTHER samples only
+                phi_c = phi(clone_frequency(Xo, Do, Dd[oth]))
+                phi_o, phi_t = phi_c[:, None], phi_c
+            else:
+                phi_o, phi_t = phi_v[oth], phi_v[ti]
             for _ in range(n_iter):
                 mu = lam[:, None] * Lo[None, :]
                 ex, var, _ = _trunc_moments(mu.ravel(),
@@ -690,7 +852,7 @@ def estimate_dropout_N(df: pd.DataFrame,
                 lam = lam * np.exp(np.clip(U / np.maximum(I, 1e-300), -2, 2))
             det_t = DET[keep, ti]
             mu_t = lam * L[ti]
-            q_nb = stats.nbinom.sf(c[ti] - 1, phi_v[ti], phi_v[ti] / (phi_v[ti] + mu_t))
+            q_nb = stats.nbinom.sf(c[ti] - 1, phi_t, phi_t / (phi_t + mu_t))
 
             def nll(logN):
                 pdet = (1 - np.exp(-np.exp(logN) * lam)) * q_nb
@@ -1161,6 +1323,7 @@ def simulate_like_patient(df: pd.DataFrame,
                           fold_changes=(2, 4, 10, 30),
                           max_clones: Optional[int] = None,
                           seed: int = 0,
+                          shape: str = 'trend',
                           count_col: str = 'count',
                           lib_col: str = 'lib',
                           depth_col: str = 'D_t',
@@ -1180,14 +1343,19 @@ def simulate_like_patient(df: pd.DataFrame,
 
     Returns (sim, truth): sim in the usual long format (detected rows only, with the
     real per-sample columns); truth has one row per simulated clone with fold,
-    sign, log_fold_true (over the series) and log10_lambda.
+    sign, log_fold_true (over the series, or peak / baseline for shape='peak'),
+    peak_day_true (shape='peak') and log10_lambda.
+
+    shape='peak' : spiked clones instead rise and fall back: a Gaussian bump (width =
+    span / 4) of height F centred on a random interior sampled day.
     """
     rng = np.random.default_rng(seed)
     fold_changes = np.asarray(fold_changes, float)
     sims, truths = [], []
     for pat, g in df.groupby('patient'):
         days = np.sort(g[time_col].unique())
-        phi_p = _phi_vector(phi, pat, days, time_col)[None, :]
+        trend = isinstance(phi, PhiTrend)
+        phi_p = None if trend else _phi_vector(phi, pat, days, time_col)[None, :]
         per_day = (g.groupby(time_col)[[lib_col, depth_col, cutoff_col]].first()
                     .reindex(days))
         L = per_day[lib_col].to_numpy(float)
@@ -1203,12 +1371,29 @@ def simulate_like_patient(df: pd.DataFrame,
         if max_clones is not None and len(lam) > max_clones:
             lam = rng.choice(lam, size=max_clones, replace=False)
         n = len(lam)
+        if trend:          # phi of each clone from its baseline frequency (lambda ~ f)
+            phi_p = phi(lam)[:, None]
         s = (days - days.mean()) / np.ptp(days)
         spiked = rng.random(n) < frac_spike
         fold = np.where(spiked, rng.choice(fold_changes, size=n), 1.0)
         sign = np.where(spiked, rng.choice([-1, 1], size=n), 0)
         b = sign * np.log(fold)                                # log fold over the series
-        lam_t = lam[:, None] * np.exp(b[:, None] * s[None, :])
+        t_pk = np.full(n, np.nan)
+        if shape == 'trend':
+            prof_t = b[:, None] * s[None, :]
+        elif shape == 'peak':
+            # transient: rise to peak and fall back; peak at a random interior sampled day,
+            # Gaussian bump with width = span / 4; 'fold' = peak / baseline
+            inner = days[1:-1] if len(days) > 2 else days
+            t_pk = np.where(spiked, rng.choice(inner, size=n), np.nan)
+            width = np.ptp(days) / 4
+            bump = np.nan_to_num(np.exp(-0.5 * ((days[None, :] - t_pk[:, None]) / width) ** 2))
+            prof_t = np.abs(b)[:, None] * bump
+            sign = np.where(spiked, 1, 0)
+            b = np.abs(b)
+        else:
+            raise ValueError("shape must be 'trend' or 'peak'")
+        lam_t = lam[:, None] * np.exp(prof_t)
         mu = lam_t * L[None, :]
         present = rng.random(mu.shape) >= np.exp(-N[None, :] * lam_t)
         x = rng.negative_binomial(phi_p, phi_p / (phi_p + mu)).astype(float)
@@ -1219,7 +1404,7 @@ def simulate_like_patient(df: pd.DataFrame,
                                   depth_col: Dd[ti], cutoff_col: c[ti]}))
         truths.append(pd.DataFrame({'patient': pat, 'clono': np.arange(n),
                                     'spiked': spiked, 'fold': fold, 'sign': sign,
-                                    'log_fold_true': b,
+                                    'log_fold_true': b, 'peak_day_true': t_pk,
                                     'log10_lambda': np.log10(lam)}))
     return pd.concat(sims, ignore_index=True), pd.concat(truths, ignore_index=True)
 
@@ -1235,7 +1420,8 @@ def spike_in_power(df: pd.DataFrame,
                    n_jobs: int = 1,
                    cutoff_col: str = 'c_t',
                    time_col: str = 'day',
-                   test_kwargs: Optional[dict] = None) -> dict:
+                   test_kwargs: Optional[dict] = None,
+                   shape: str = 'trend') -> dict:
     """Power of the dropout trajectory test, by fold change and abundance, per person.
 
     For each person: estimate N_t on the real data, simulate with known trends on the
@@ -1250,8 +1436,11 @@ def spike_in_power(df: pd.DataFrame,
     Returns dict with
       'power'   : per person x fold x abundance band: n spiked, fraction tested
                   (>= min_detect detections), power among ALL spiked clones and among
-                  TESTED ones (q < alpha), sign accuracy among calls, median
-                  estimated / true log fold;
+                  TESTED ones (q < alpha); among calls: shape_correct (slope design:
+                  right sign; quadratic: classified 'up'/'down' for trends, 'peak' for
+                  peaks), median estimated / true log fold (quadratic: fitted max/min
+                  over the series), and for peaks peak_day_correct (extreme_day equals
+                  the simulated peak day);
       'fdr'     : per person: calls, false calls (unspiked clones), observed FDR;
       'realism' : real vs simulated number of testable clones and detection rate;
       'per_clone': truth merged with test results.
@@ -1265,7 +1454,8 @@ def spike_in_power(df: pd.DataFrame,
                                          time_col=time_col)
             sim, truth = simulate_like_patient(sub, phi_p, Nt_real, frac_spike,
                                                fold_changes, max_clones, seed,
-                                               cutoff_col=cutoff_col, time_col=time_col)
+                                               cutoff_col=cutoff_col, time_col=time_col,
+                                               shape=shape)
             Nt_sim = estimate_dropout_N(sim, phi=phi_p, cutoff_col=cutoff_col,
                                         time_col=time_col)
             res = nb_trajectory_test(sim, phi_p, likelihood='dropout', dropout_N=Nt_sim,
@@ -1273,11 +1463,25 @@ def spike_in_power(df: pd.DataFrame,
                                      n_jobs=n_jobs, **(test_kwargs or {}))
         res = add_qvalues(res, p_col='p_value', by='patient')
         span = float(np.ptp(np.sort(sub[time_col].unique())))
-        m = truth.merge(res[['patient', 'clono', 'beta', 'p_value', 'q_value', 'direction']],
-                        on=['patient', 'clono'], how='left')
+        keepc = ['patient', 'clono', 'beta', 'p_value', 'q_value'] + \
+                [k for k in ('direction', 'shape', 'extreme_day', 'amplitude_fold')
+                 if k in res.columns]
+        m = truth.merge(res[keepc], on=['patient', 'clono'], how='left')
         m['tested'] = m['p_value'].notna()
         m['called'] = m['q_value'] < alpha
-        m['log_fold_est'] = m['beta'] * span
+        quad = 'shape' in m.columns
+        if quad:                                   # fitted max / min over the series
+            m['log_fold_est'] = np.log(m['amplitude_fold'])
+            exp_shape = (np.where(m['sign'] > 0, 'up', 'down') if shape == 'trend'
+                         else np.full(len(m), 'peak'))
+            m['shape_correct'] = m['shape'] == exp_shape
+            m['est_over_true'] = m['log_fold_est'] / m['log_fold_true'].abs()
+        else:
+            m['log_fold_est'] = m['beta'] * span
+            m['shape_correct'] = (np.sign(m['beta']) == m['sign']) if shape == 'trend' \
+                else np.nan
+            m['est_over_true'] = (m['log_fold_est'] / m['log_fold_true']) if shape == 'trend' \
+                else np.nan
         m['band'] = pd.cut(m['log10_lambda'], list(abundance_edges))
         per_clone.append(m)
 
@@ -1289,9 +1493,12 @@ def spike_in_power(df: pd.DataFrame,
                 'frac_tested': gg['tested'].mean(),
                 'power_all': gg['called'].mean(),
                 'power_tested': gg.loc[gg['tested'], 'called'].mean() if gg['tested'].any() else np.nan,
-                'sign_correct': (np.sign(calls['beta']) == calls['sign']).mean() if len(calls) else np.nan,
-                'est_over_true_logfold': (calls['log_fold_est'] / calls['log_fold_true']).median()
-                                         if len(calls) else np.nan})
+                'shape_correct': calls['shape_correct'].astype(float).mean()
+                                 if len(calls) else np.nan,
+                'est_over_true_logfold': calls['est_over_true'].median()
+                                         if len(calls) else np.nan,
+                'peak_day_correct': (calls['extreme_day'] == calls['peak_day_true']).mean()
+                                    if len(calls) and quad and shape == 'peak' else np.nan})
         calls = m[m['called']]
         fdr_rows.append({'patient': pat, 'n_calls': len(calls),
                          'false_calls': int((~calls['spiked']).sum()),
@@ -1773,3 +1980,158 @@ def conservative_phi(per_sample: pd.DataFrame, phi_ref: float,
     t['phi'] = np.minimum(float(phi_ref), t['phi_sample'])
     t['source'] = np.where(t['phi_sample'] < phi_ref, 'own', 'donor reference')
     return t[['patient', time_col, 'phi', 'phi_sample', 'source']]
+
+
+# =============================================================================
+# Frequency-dependent dispersion: phi(f) from donors
+# =============================================================================
+#
+# The NB dispersion of healthy donors rises with clone frequency (rare clones are
+# noisier relative to their mean than the NB with one phi allows), as in DESeq2/edgeR
+# trended dispersions. phi is estimated in frequency bins (truncated, Cox-Reid) and a
+# trend log(phi) = a + b log10(f) is fitted to the bins. The reference curve for
+# patients is the pointwise minimum over donors (the noisiest donor at each frequency).
+
+class PhiTrend:
+    """Dispersion as a function of clone frequency f.
+
+    Piecewise linear in (log10 f, log phi) between knots, constant outside them (no
+    extrapolation). Call it on an array of frequencies to get phi.
+    """
+
+    def __init__(self, log10_f, phi):
+        log10_f = np.asarray(log10_f, float)
+        o = np.argsort(log10_f)
+        self.log10_f = log10_f[o]
+        self.log_phi = np.log(np.asarray(phi, float))[o]
+
+    def __call__(self, f):
+        lf = np.log10(np.maximum(np.asarray(f, float), 1e-300))
+        return np.exp(np.interp(lf, self.log10_f, self.log_phi))
+
+    @classmethod
+    def loglinear(cls, a, b, log10_lo, log10_hi, n=50):
+        """log phi = a + b * log10 f on [log10_lo, log10_hi], constant outside."""
+        grid = np.linspace(log10_lo, log10_hi, n)
+        return cls(grid, np.exp(a + b * grid))
+
+    @classmethod
+    def constant(cls, phi):
+        return cls([-12.0, 0.0], [phi, phi])
+
+    @classmethod
+    def minimum(cls, trends, n=80):
+        """Pointwise minimum of several trends (on the union of their ranges)."""
+        trends = list(trends)
+        lo = min(t.log10_f[0] for t in trends)
+        hi = max(t.log10_f[-1] for t in trends)
+        grid = np.linspace(lo, hi, n)
+        return cls(grid, np.min([t(10.0 ** grid) for t in trends], axis=0))
+
+    def table(self, log10_f=None):
+        lf = self.log10_f if log10_f is None else np.asarray(log10_f, float)
+        return pd.DataFrame({'log10_freq': lf, 'phi': self(10.0 ** lf)})
+
+    def __repr__(self):
+        return (f"PhiTrend(log10 f in [{self.log10_f[0]:.2f}, {self.log10_f[-1]:.2f}], "
+                f"phi in [{np.exp(self.log_phi.min()):.3g}, {np.exp(self.log_phi.max()):.3g}])")
+
+
+def clone_frequency(X: np.ndarray, DET: np.ndarray, D: np.ndarray) -> np.ndarray:
+    """Clone frequency over its DETECTED samples: sum_t x_ct / sum_t D_t (t detected).
+
+    The same definition as the frequency used to bin clones in ``fit_phi_trend``.
+    X, DET: clones x samples; D: depth per sample.
+    """
+    num = np.where(DET, X, 0.0).sum(axis=1)
+    den = (DET * np.asarray(D, float)[None, :]).sum(axis=1)
+    return num / np.maximum(den, 1e-300)
+
+
+def fit_phi_trend(df: pd.DataFrame,
+                  count_col: str = 'count',
+                  lib_col: str = 'lib',
+                  depth_col: str = 'D_t',
+                  c_col: str = 'c_t',
+                  min_detect: int = 2,
+                  min_freq_mult: float = 10.0,
+                  cutoff_frac: float = CUTOFF_FRAC,
+                  n_bins: int = 6,
+                  min_bin_clones: int = 200,
+                  truncate: bool = True,
+                  cox_reid: bool = True) -> dict:
+    """Frequency-dependent NB dispersion for ONE person (e.g. one donor).
+
+    Clones as in ``fit_nb_dispersion_cr`` (detected rows, >= min_detect detections,
+    frequency >= min_freq_mult * cutoff), split into n_bins quantile bins of
+    log10 frequency; phi is fitted in each bin (truncated at c, Cox-Reid). A line
+    log(phi) = a + b * log10(f) is then fitted to the bins (weights = clones per bin;
+    bins whose fit hit the search bound are left out) and returned as a PhiTrend from
+    the estimation floor (min_freq_mult * cutoff) to the highest bin centre, constant
+    outside that range.
+
+    Returns dict: phi_global (one phi for all clones), bins (DataFrame: log10_freq =
+    median log10 frequency of the bin, n_clones, phi, at_bound), a, b, trend.
+    """
+    _require(df, ['patient', 'day', 'clono', count_col, lib_col, depth_col]
+             + ([c_col] if truncate else []))
+    x, L, Dd, starts, n_per, c = _sparse_blocks(
+        df, count_col, lib_col, depth_col, min_detect, c_col if truncate else None)
+    if len(n_per) == 0:
+        raise ValueError("no clones with enough detections")
+    sx = np.add.reduceat(x, starts)
+    p_hat = sx / np.add.reduceat(L, starts)
+    p_depth = sx / np.add.reduceat(Dd, starts)
+    keep = p_depth >= min_freq_mult * cutoff_frac
+    obs = np.repeat(keep, n_per)
+    x, L = x[obs], L[obs]
+    c = None if c is None else c[obs]
+    n_per, p_hat, p_depth = n_per[keep], p_hat[keep], p_depth[keep]
+    starts = np.concatenate([[0], np.cumsum(n_per)[:-1]])
+    phi_global, _ = _fit_phi(x, L, starts, n_per, p_hat, True, c, cox_reid)
+
+    lp = np.log10(p_depth)
+    edges = np.unique(np.quantile(lp, np.linspace(0, 1, n_bins + 1)))
+    b_of = np.clip(np.digitize(lp, edges[1:-1]), 0, len(edges) - 2)
+    rows = []
+    for k in range(len(edges) - 1):
+        m = b_of == k
+        if m.sum() < min_bin_clones:
+            continue
+        o = np.repeat(m, n_per)
+        npb = n_per[m]
+        sb = np.concatenate([[0], np.cumsum(npb)[:-1]])
+        phi_k, at_b = _fit_phi(x[o], L[o], sb, npb, p_hat[m], True,
+                               None if c is None else c[o], cox_reid)
+        rows.append({'log10_freq': float(np.median(lp[m])), 'n_clones': int(m.sum()),
+                     'phi': phi_k, 'at_bound': at_b})
+    bins = pd.DataFrame(rows)
+    ok = ~bins['at_bound']
+    if ok.sum() >= 2:
+        b, a = np.polyfit(bins.loc[ok, 'log10_freq'], np.log(bins.loc[ok, 'phi']), 1,
+                          w=np.sqrt(bins.loc[ok, 'n_clones']))
+        # the line is used from the estimation floor (the lowest bin centre lies just
+        # above it) up to the highest bin centre; constant beyond that
+        lo = min(np.log10(min_freq_mult * cutoff_frac), bins['log10_freq'].min())
+        trend = PhiTrend.loglinear(a, b, lo, bins['log10_freq'].max())
+    else:
+        a, b, trend = np.log(phi_global), 0.0, PhiTrend.constant(phi_global)
+    return {'phi_global': phi_global, 'bins': bins, 'a': float(a), 'b': float(b),
+            'trend': trend, 'n_clones': int(keep.sum())}
+
+
+def fit_phi_trends(df: pd.DataFrame, **kwargs) -> dict:
+    """``fit_phi_trend`` for every person in df: {patient: result dict}."""
+    return {p: fit_phi_trend(g, **kwargs) for p, g in df.groupby('patient')}
+
+
+def reference_phi_trend(trends: dict, exclude=None) -> 'PhiTrend':
+    """Pointwise minimum of the persons' trends (the noisiest at each frequency).
+
+    trends : output of ``fit_phi_trends`` (or {name: PhiTrend});
+    exclude: names to leave out (e.g. the held-out donor in leave-one-donor-out).
+    """
+    exclude = set([exclude] if isinstance(exclude, str) else (exclude or []))
+    ts = [(v['trend'] if isinstance(v, dict) else v)
+          for k, v in trends.items() if k not in exclude]
+    return PhiTrend.minimum(ts)
