@@ -1,0 +1,11 @@
+{
+  "HDBR03_SEQTR_ReSeq": {
+    "fraction_seen_once": 0.8393886053064715,
+    "fraction_seen_twice": 0.08455625769662266,
+    "fraction_seen_3plus": 0.07605513699690587,
+    "distinct_clones": 419827.0,
+    "clones_used_for_phi": 17964.0,
+    "median_count": 20.0,
+    "clones_per_sample_median": 100372.0
+  }
+}
