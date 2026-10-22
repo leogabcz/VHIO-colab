@@ -794,7 +794,7 @@ def estimate_dropout_N(df: pd.DataFrame,
                        phi: Union[float, dict],
                        count_col: str = 'count',
                        lib_col: str = 'lib',
-                       cutoff_col: str = 'c_t',
+                       c_val: int = 1,
                        time_col: str = 'day',
                        depth_col: str = 'D_t',
                        min_other: int = 2,
@@ -807,8 +807,12 @@ def estimate_dropout_N(df: pd.DataFrame,
     person's OTHER samples, estimate their lambda from those other samples only
     (NB MLE truncated at c, at fixed phi), and find the N_t maximising
         sum_clones log P(detected at t or not | lambda, N_t),
-        P(detected) = (1 - exp(-N_t lambda)) * P_NB(X >= c_t | L_t lambda, phi).
+        P(detected) = (1 - exp(-N_t lambda)) * P_NB(X >= c | L_t lambda, phi).
     Selection and lambda never use sample t, so the estimate is free of selection bias.
+
+    c_val : detection threshold, the same for every sample (integer >= 1). A clone is
+        detected in a sample if count >= c_val; with c_val = 1 (raw tables) a miss
+        contributes P(X = 0).
 
     Estimates are flagged in two directions, relative to the median of the person's
     OTHER samples (factor flag_rel) or near the search bounds:
@@ -823,20 +827,23 @@ def estimate_dropout_N(df: pd.DataFrame,
     Returns patient, time_col, N_t, N_t_raw, flagged, low_capture, n_clones, observed and predicted
     detection rates at t (a check of the fit), and N_t relative to the person's median.
     """
+    if not float(c_val).is_integer() or c_val < 1:
+        raise ValueError(f"c_val must be an integer >= 1, got {c_val!r}")
+
     rows = []
-    for patient, g in df.groupby('patient'):
+    for patient, g in df.groupby('patient', observed=True):
         days = np.sort(g[time_col].unique())
         trend = isinstance(phi, PhiTrend)
         phi_v = None if trend else _phi_vector(phi, patient, days, time_col)
-        dcols = [lib_col, cutoff_col] + ([depth_col] if depth_col in g.columns else [])
+        dcols = [lib_col] + ([depth_col] if depth_col in g.columns else [])
         per_day = g.groupby(time_col)[dcols].first().reindex(days)
         L = per_day[lib_col].to_numpy(float)
-        c = per_day[cutoff_col].to_numpy(float)
+        c = np.full(len(days), float(c_val))
         Dd = per_day[depth_col].to_numpy(float) if depth_col in g.columns else L
         X = (g.pivot_table(index='clono', columns=time_col, values=count_col,
                            aggfunc='sum', fill_value=0)
                .reindex(columns=days, fill_value=0).to_numpy(float))
-        DET = X > 0
+        DET = X >= c_val
         for ti in range(len(days)):
             oth = np.delete(np.arange(len(days)), ti)
             Xo, Do = X[:, oth], DET[:, oth]
@@ -846,7 +853,7 @@ def estimate_dropout_N(df: pd.DataFrame,
             Xo, Do = Xo[keep], Do[keep]
             Lo, co = L[oth], c[oth]
             # truncated NB MLE of lambda from the other samples' detected counts
-            lam = Xo.sum(1) / (Do * Lo).sum(1)
+            lam = (Xo * Do).sum(1) / (Do * Lo).sum(1)
             if trend:     # per-clone phi, from the frequency in the OTHER samples only
                 phi_c = phi(clone_frequency(Xo, Do, Dd[oth]))
                 phi_o, phi_t = phi_c[:, None], phi_c
@@ -931,7 +938,6 @@ def estimate_dropout_N(df: pd.DataFrame,
                     out.at[idx, 'N_t'] = float(ok.median())
     out['N_t_rel'] = out['N_t'] / out.groupby('patient')['N_t'].transform('median')
     return out
-
 
 def nb_trajectory_test_censored(df: pd.DataFrame,
                                 phi: Union[float, dict],
