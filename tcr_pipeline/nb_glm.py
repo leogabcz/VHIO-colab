@@ -264,25 +264,36 @@ def _fit_phi(x, L, starts, n_per, lam0, resolve_mean: bool = True,
     return phi, bool(at_bound)
 
 
-def _sparse_blocks(df, count_col, lib_col, depth_col, min_detect, c_col=None):
+def _sparse_blocks(df, count_col, lib_col, depth_col, min_detect, c_val=1):
     """Detected rows only, one row per (patient, clono, day), clone-contiguous.
 
-    Returns x, L, D, starts, n_per, c (c is None when c_col is None).
+    c_val : detection threshold, the same for every sample (integer >= 1), or None for
+        no truncation. A (patient, clono, day) whose summed count is < c_val counts as
+        not reported and is dropped. With c_val=1 every row with at least one read stays.
+
+    Returns x, L, D, starts, n_per, c. c is an int array (c_val repeated for every
+    observation) or None when c_val is None.
     """
-    cols = list(dict.fromkeys([lib_col, depth_col] + ([c_col] if c_col else [])))
-    agg = {count_col: 'sum', **{col: 'first' for col in cols}}
+    thr = 1 if c_val is None else int(np.ceil(c_val))
+    if thr < 1:
+        raise ValueError("c_val must be >= 1")
+    agg = {count_col: 'sum',
+           **{col: 'first' for col in dict.fromkeys([lib_col, depth_col])}}
     d = (df[df[count_col] > 0]
-         .groupby(KEYS, as_index=False, sort=True).agg(agg))
-    d['n_det'] = d.groupby(['patient', 'clono'])['day'].transform('size')
+         .groupby(KEYS, as_index=False, sort=True, observed=True).agg(agg))
+    d = d[d[count_col] >= thr]                      # threshold on the summed count
+    d = d.assign(n_det=d.groupby(['patient', 'clono'], observed=True)['day'].transform('size'))
     d = d[d['n_det'] >= min_detect].reset_index(drop=True)
     if len(d) == 0:
         return (np.array([]),) * 3 + (np.array([], int),) * 2 + (None,)
-    if c_col and (d[count_col] < d[c_col]).any():
-        raise ValueError("detected counts below the per-sample threshold c: check c_col")
-    key = d['patient'].astype(str) + '|' + d['clono'].astype(str)
-    starts = np.flatnonzero((key != key.shift()).values)
+
+    pid = pd.factorize(d['patient'])[0]             # clone boundaries from integer codes
+    cid = pd.factorize(d['clono'])[0]
+    new = np.ones(len(d), dtype=bool)
+    new[1:] = (pid[1:] != pid[:-1]) | (cid[1:] != cid[:-1])
+    starts = np.flatnonzero(new)
     n_per = np.diff(np.append(starts, len(d)))
-    c = d[c_col].to_numpy(int) if c_col else None
+    c = None if c_val is None else np.full(len(d), thr, dtype=int)
     return (d[count_col].to_numpy(float), d[lib_col].to_numpy(float),
             d[depth_col].to_numpy(float), starts, n_per, c)
 
@@ -298,7 +309,7 @@ def fit_nb_dispersion_cr(df: pd.DataFrame,
                          min_bin_clones: int = 50,
                          resolve_mean: bool = True,
                          truncate: bool = True,
-                         c_col: str = 'c',
+                         c_val: int = 1,
                          cox_reid: bool = True) -> dict:
     """Shared NB dispersion from healthy donors (sparse, truncated, Cox-Reid).
 
@@ -317,7 +328,9 @@ def fit_nb_dispersion_cr(df: pd.DataFrame,
         False plugs in the fixed pooled ratio (previous behaviour).
     truncate : model detected counts as NB truncated at c (conditional on detection).
         False uses the untruncated pmf (previous behaviour).
-    c_col : column holding the per-sample detection threshold.
+    c_val : int
+        Detection threshold, the same for all samples (1 for the raw tables). Detected
+        counts are modelled as NB truncated at c_val, X >= c_val. Raising it above 1 
     cox_reid : include the Cox-Reid adjustment (False = plain profile, for comparison).
 
     Returns
@@ -325,10 +338,9 @@ def fit_nb_dispersion_cr(df: pd.DataFrame,
     dict with 'phi', 'phi_at_bound', 'n_clones', 'n_obs', 'bins' (DataFrame), and the
     settings used, for provenance.
     """
-    _require(df, ['patient', 'day', 'clono', count_col, lib_col, depth_col]
-             + ([c_col] if truncate else []))
+    _require(df, ['patient', 'day', 'clono', count_col, lib_col, depth_col])
     x, L, Dd, starts, n_per, c = _sparse_blocks(
-        df, count_col, lib_col, depth_col, min_detect, c_col if truncate else None)
+        df, count_col, lib_col, depth_col, min_detect, c_val if truncate else None)
     if len(n_per) == 0:
         raise ValueError("no clones with enough detections")
 
@@ -373,7 +385,7 @@ def fit_nb_dispersion_cr(df: pd.DataFrame,
             'settings': dict(min_detect=min_detect, min_freq_mult=min_freq_mult,
                              cutoff_frac=cutoff_frac, lib_col=lib_col,
                              resolve_mean=resolve_mean, truncate=truncate,
-                             c_col=c_col, cox_reid=cox_reid)}
+                             c_val=c_val, cox_reid=cox_reid)}
 
 
 def _phi_vector(phi, patient, days, time_col: str = 'day') -> np.ndarray:
@@ -1893,8 +1905,12 @@ def fit_phi_trend(df: pd.DataFrame,
                                None if c is None else c[o], cox_reid)
         rows.append({'log10_freq': float(np.median(lp[m])), 'n_clones': int(m.sum()),
                      'phi': phi_k, 'at_bound': at_b})
-    bins = pd.DataFrame(rows)
-    ok = ~bins['at_bound']
+    # Preserve the expected columns even if no frequency bin was fitted.
+    bins = pd.DataFrame(
+    rows,
+    columns=['log10_freq', 'n_clones', 'phi', 'at_bound']
+    )
+    ok = ~bins['at_bound'].astype(bool)
     if ok.sum() >= 2:
         b, a = np.polyfit(bins.loc[ok, 'log10_freq'], np.log(bins.loc[ok, 'phi']), 1,
                           w=np.sqrt(bins.loc[ok, 'n_clones']))

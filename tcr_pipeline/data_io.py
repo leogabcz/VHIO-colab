@@ -15,382 +15,143 @@ count      : int   — raw count
 """
 
 import re
-try:  # R bridge is optional: only load_anonymized_rds needs it
-    import rpy2.robjects as ro
-    from rpy2.robjects import pandas2ri
-except ImportError:
-    ro = None
-    pandas2ri = None
 import pandas as pd
-import rdata
 from typing import Optional
 import os
 import numpy as np
+from pathlib import Path
 
-def load_rdata(data_dir: str) -> dict:
+ROOTS = {
+    "donors":   Path("../data/donors_clono/"),
+    "patients": Path("../data/patients_clono/"),    # adjust if different
+}
+# each root contains: counts/<subject>.csv, sequences/<subject>_sequences.csv,
+#                     sample_sizes.csv, subjects.txt
+
+_COUNT_DTYPES = {"day": "int16", "clono": "int32", "count": "int32"}
+
+def _sample_sizes(group):
+    return pd.read_csv(_root(group) / "sample_sizes.csv",
+                       dtype={"patient": str, "day": "int16", "D_t": "int64"})
+
+def _root(group) -> Path:
+    if group not in ROOTS:
+        raise KeyError(f"unknown group {group!r}; use one of {list(ROOTS)}")
+    return ROOTS[group]
+
+def write_subject_list(group):
+    """Write subjects.txt (one name per line) from the files in counts/. Only creates/overwrites that file."""
+    root = _root(group)
+    names = sorted(p.stem for p in (root / "counts").glob("*.csv"))
+    if not names:
+        raise FileNotFoundError(f"no count files in {root / 'counts'}")
+    (root / "subjects.txt").write_text("\n".join(names) + "\n")
+    return names
+
+
+def list_subjects(group: str):
+    """Read the names from subjects.txt; checks that every listed subject has a counts file."""
+    root = _root(group)
+    txt = root / "subjects.txt"
+    if not txt.exists():
+        raise FileNotFoundError(f"{txt} not found; run write_subject_list({group!r}) first")
+    names = [l.strip() for l in txt.read_text().splitlines() if l.strip()]
+    missing = [n for n in names if not (root / "counts" / f"{n}.csv").exists()]
+    if missing:
+        raise FileNotFoundError(f"listed in {txt.name} but without a counts file: {missing}")
+    return names
+
+def load_subject(group: str, subject: str,
+                 min_count: int = 1,
+                 days=None,
+                 with_D_t: bool = False,
+                 with_freq: bool = False,
+                 R_labels: bool = False,
+                 add_patient: bool = True,
+                 add_group: bool = False) -> pd.DataFrame:
     """
-    Load the raw rdata file into a nested python dictionary
-    
-    Parameters
-    ----------
-    data_dir : str
-        Location of the Rdata file
-    
-    Retrurns
-    --------
-    converted : dict
-        Nested dictionary of the data following the canonical schema
+    One donor or patient, long format: [group], [patient], day, clono, count [, D_t] [, freq].
+
+    min_count    keep rows with count >= min_count (applied after reading)
+    days         iterable of days to keep (None = all)
+    with_D_t     add the library size of each row's sample
+    with_freq    add count / D_t
+    R_labels     make `clono` the string 'clono_<id>' (heavier; one subject at a time)
+    add_patient  add a `patient` column (the subject name)
+    add_group    add a `group` column ('donors' / 'patients')
     """
-    
-    parsed = rdata.parser.parse_file(data_dir)
-    converted = rdata.conversion.convert(parsed)
-    return converted
+    root = _root(group)
+    path = root / "counts" / f"{subject}.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} (available: {list_subjects(group)})")
 
-def parse_day(day_str: str) -> int:
-    """
-    Extract the numeric day from a string key like 'd0', 'd14', 'd-9'.
+    d = pd.read_csv(path, dtype=_COUNT_DTYPES)
+    if days is not None:
+        d = d[d["day"].isin(list(days))]
+    if min_count > 1:
+        d = d[d["count"] >= min_count]
+    d = d.reset_index(drop=True)
 
-    Parameters
-    ----------
-    day_str : str
-        Timepoint key, expected format 'd<integer>' (e.g. 'd0', 'd14', 'd-9').
+    if with_D_t or with_freq:
+        s = _sample_sizes(group)
+        s = s[s["patient"] == subject].drop(columns="patient")
+        d = d.merge(s, on="day", how="left", validate="many_to_one")
+        if d["D_t"].isna().any():
+            missing = sorted(d.loc[d["D_t"].isna(), "day"].unique().tolist())
+            raise ValueError(f"{group}/{subject}: no library size for days {missing}")
+        if with_freq:
+            d["freq"] = d["count"] / d["D_t"]
+        if not with_D_t:
+            d = d.drop(columns="D_t")
 
-    Returns
-    -------
-    int
-
-    Raises
-    ------
-    ValueError
-        If the string does not match the expected pattern.
-    """
-    match = re.fullmatch(r"d(-?\d+)", day_str)
-    if match is None:
-        raise ValueError(
-            f"Timepoint key '{day_str}' does not match expected format 'd<integer>'. "
-            "Examples of valid keys: 'd0', 'd14', 'd-9'."
-        )
-    return int(match.group(1))
-
-
-def nested_dict_to_long(
-    data: dict,
-    clonotype_col: str = "clono",
-    count_col: str = "count",
-) -> pd.DataFrame:
-    """
-    Convert the raw nested-dict input into the canonical long-format DataFrame.
-
-    Parameters
-    ----------
-    data : dict
-        Nested dict with structure:
-            { donor: { day_str: pd.DataFrame(clonotype_col, count_col, ...) } }
-        Extra columns in the per-timepoint DataFrames are dropped.
-    clonotype_col : str
-        Name of the clonotype identifier column in the per-timepoint DataFrames.
-    count_col : str
-        Name of the raw count column.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns: donor, day (int), clonotype, count.
-        Sorted by donor -> day -> clonotype.
-    """
-    frames = []
-    for donor, timepoints in data.items():
-        for day_str, df in timepoints.items():
-            day = parse_day(day_str)
-            frame = df.copy()
-            frame = frame.rename(columns={clonotype_col: "clono", count_col: "count"})
-            frame["donor"] = donor
-            frame["day"] = day
-            frames.append(frame)
-
-    if not frames:
-        raise ValueError("Input data dict is empty.")
-
-    long = pd.concat(frames, ignore_index=True)
-    long["count"] = long["count"].astype(int)
-
-    long = long[["donor", "day", "clono", "count"]]
-    long = long.rename(columns={"donor": "patient", "clono": "clono"})
-
-    return long.sort_values(["patient", "day", "clono"]).reset_index(drop=True)
-
-def load_anonymized_rds(path, min_frac=1e-6):
-    """Load VHIO's anonymized RDS into long format.
-
-    Adds:
-        D_t      : pre-filter in-frame depth, recovered from freq_in
-        c_t      : read cutoff implied by the upstream filter
-                   freq >= 1e-6
-        lib_post : post-filter read sum, kept for comparison only
-    """
-    if ro is None:
-        raise ImportError(
-            "load_anonymized_rds requires rpy2 and a working R installation."
-        )
-
-    frames = []
-
-    with (ro.default_converter + pandas2ri.converter).context():
-        rds = ro.r['readRDS'](path)
-
-        donor_names = rds.names()
-
-        for i, donor in enumerate(donor_names):
-            tps = rds[i]
-
-            tp_names = tps.names()
-
-            for j, tp in enumerate(tp_names):
-                df = ro.conversion.get_conversion().rpy2py(tps[j])
-
-                df = df.assign(
-                    patient=donor,
-                    day=int(str(tp).lstrip('d'))
-                )
-
-                frames.append(
-                    df[['patient', 'day', 'clono', 'count', 'freq_in']]
-                )
-
-    d = pd.concat(frames, ignore_index=True)
-
-    d['count'] = d['count'].astype(int)
-
-    g = [d['patient'], d['day']]
-
-    # Recover the pre-filter sequencing depth.
-    # freq_in is expressed as a percentage.
-    d['D_t'] = (
-        (d['count'] * 100 / d['freq_in'])
-        .groupby(g)
-        .transform('median')
-    )
-
-    # Read cutoff implied by freq >= min_frac.
-    d['c_t'] = np.ceil(min_frac * d['D_t'] - 1e-6)
-
-    # Sum of reads remaining after the upstream filtering.
-    d['lib_post'] = (
-        d.groupby(['patient', 'day'])['count']
-        .transform('sum')
-    )
-
-    # Check that the inferred cutoff agrees with the minimum
-    # observed count in each patient/day.
-    chk = d.groupby(['patient', 'day']).agg(
-        c_t=('c_t', 'first'),
-        obs_min=('count', 'min')
-    )
-
-    bad = chk[chk['c_t'] != chk['obs_min']]
-
-    if len(bad):
-        print("WARNING cutoff mismatch:\n", bad)
-
+    if R_labels:
+        d["clono"] = "clono_" + d["clono"].astype(str)
+    if add_patient:
+        d.insert(0, "patient", pd.Categorical([subject] * len(d), categories=[subject]))
+    if add_group:
+        d.insert(0, "group", pd.Categorical([group] * len(d), categories=[group]))
     return d
 
-def long_df_to_wide(
-    data: pd.DataFrame,
-    values: str = "count",
-) -> dict:
+def load_group(group,
+               subjects=None,
+               min_count=1,
+               days=None,
+               with_D_t=True,
+               with_freq=True,
+               add_group=False,
+               compact=True):
     """
-    Convert the long format data frame a dict of wide-format DataFrames,
-    one per donor.
+    All subjects of a group ('donors' or 'patients') in one long DataFrame.
 
-    Wide format: rows = clonotypes, columns = days (as integers), values = counts.
-    Clonotypes absent at a given timepoint are filled with `fill_value`.
+    subjects   list of names to load (None = every name in subjects.txt)
+    compact    store D_t as int32 and freq as float32 (halves the memory of those two columns)
+    Other arguments are passed to load_subject.
 
-    Parameters
-    ----------
-    data : pd.df
-        Long-form canonical dataframe 
-    values : str
-        Values which will be shown in the wide format (e.g. count, norm_counts)
-
-    
-    Returns
-    -------
-    dict
-        { donor: pd.DataFrame }
-        Each DataFrame has clonotype as the index, day integers as columns,
-        sorted in ascending day order.
+    Note: `clono` ids are local to each subject. Always index on (patient, clono) together.
     """
-    
-    result = {}
-    for donor, donor_df in data.groupby("patient"):
-        wide = (
-            donor_df
-            .pivot(index="clono", columns="day", values=values)
-        )
-        wide.columns.name = None
-        wide = wide[sorted(wide.columns)]
-        result[donor] = wide
+    names = list_subjects(group) if subjects is None else list(subjects)
+    parts = []
+    for s in names:
+        parts.append(load_subject(group, s, min_count=min_count, days=days,
+                                  with_D_t=with_D_t, with_freq=with_freq,
+                                  add_patient=True, add_group=add_group))
+    d = pd.concat(parts, ignore_index=True)
 
-    return result
+    # concatenating categoricals with different categories turns them into object columns
+    d["patient"] = pd.Categorical(d["patient"].astype(str), categories=names)
+    if add_group:
+        d["group"] = pd.Categorical([group] * len(d), categories=[group])
+    if compact:
+        if "D_t" in d.columns:
+            d["D_t"] = d["D_t"].astype("int32")
+        if "freq" in d.columns:
+            d["freq"] = d["freq"].astype("float32")
+    return d
 
-
-def long_to_nested_dict(
-    df: pd.DataFrame,
-    extra_cols: Optional[list] = None,
-) -> dict:
-    """
-    Convert the canonical long-format DataFrame back to a nested dict.
-    Useful if downstream tools expect the original structure.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Must contain at least: donor, day (int), clonotype, count.
-    extra_cols : list[str] | None
-        Additional columns to include in the per-timepoint DataFrames.
-        If None, all columns beyond [donor, day] are included.
-
-    Returns
-    -------
-    dict
-        { donor: { 'd<day>': pd.DataFrame } }
-    """
-    base_cols = ["clono", "count"]
-    if extra_cols is not None:
-        keep_cols = base_cols + [c for c in extra_cols if c not in base_cols]
-    else:
-        keep_cols = [c for c in df.columns if c not in ("patient", "day")]
-
-    result = {}
-    for donor, donor_df in df.groupby("patient"):
-        result[donor] = {}
-        for day, day_df in donor_df.groupby("day"):
-            result[donor][f"d{int(day)}"] = day_df[keep_cols].reset_index(drop=True)
-
-    return result
-
-def save_noise_model(model: dict, path: str) -> None:
-    """
-    Save a noise model dict to a single JSON file.
-
-    Works with any noise model produced by compute_slope_noise_model,
-    regardless of fit_distribution ('normal' or 't') — all scalar
-    parameters present per donor (e.g. mu, sigma, df) are saved.
-
-    Parameters
-    ----------
-    model : dict
-        Output of compute_slope_noise_model.
-    path : str
-        Full output path, e.g. 'results/noise_model_clr.json'.
-        Directory is created if it does not exist.
-
-    Returns
-    -------
-    None
-
-    Examples
-    --------
-    save_noise_model(model, "results/noise_model_clr.json")
-    """
-    import json
-
-    dirpath = os.path.dirname(path)
-    if dirpath:
-        os.makedirs(dirpath, exist_ok=True)
-
-    def _params(vals):
-        return {
-            k: float(v)
-            for k, v in vals.items()
-            if k not in ("rates", "clonotype_rates")
-        }
-
-    def _clonotype_rates(vals):
-        return {
-            clono: rates.tolist()
-            for clono, rates in vals.get("clonotype_rates", {}).items()
-        }
-
-    payload = {
-        "norm_col":         model["norm_col"],
-        "fit_distribution": model.get("fit_distribution", "normal"),
-        "pooled":           _params(model["pooled"]),
-        "per_donor": {
-            donor: {
-                **_params(vals),
-                "rates": vals["rates"].tolist(),
-                "clonotype_rates": _clonotype_rates(vals),
-            }
-            for donor, vals in model["per_donor"].items()
-        },
-    }
-
-    with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
-
-    print(f"Saved noise model to {path}")
-
-
-def load_noise_model(path: str) -> dict:
-    """
-    Load a noise model previously saved with save_noise_model.
-
-    Parameters
-    ----------
-    path : str
-        Path to the JSON file written by save_noise_model.
-
-    Returns
-    -------
-    dict
-        Same structure as the output of compute_slope_noise_model:
-            per_donor        : { donor: { mu, sigma, [df], rates, clonotype_rates } }
-            pooled           : { mu, sigma, [df], rates }
-            norm_col         : str
-            fit_distribution : str
-
-    Raises
-    ------
-    FileNotFoundError
-        If the file does not exist at the given path.
-
-    Examples
-    --------
-    model = load_noise_model("results/noise_model_clr.json")
-    model["pooled"]["mu"]
-    model["per_donor"]["HD106"]["rates"]
-    """
-    import json
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Noise model file not found: {path}")
-
-    with open(path) as f:
-        payload = json.load(f)
-
-    per_donor = {
-        donor: {**{
-                    k: v
-                    for k, v in vals.items()
-                    if k not in ("rates", "clonotype_rates")
-                },
-                "rates": np.array(vals["rates"]),
-                "clonotype_rates": {
-                    clono: np.array(rates)
-                    for clono, rates in vals.get("clonotype_rates", {}).items()
-                }}
-        for donor, vals in payload["per_donor"].items()
-    }
-
-    pooled_rates = np.concatenate([v["rates"] for v in per_donor.values()])
-
-    return {
-        "per_donor": per_donor,
-        "pooled": {**payload["pooled"], "rates": pooled_rates},
-        "norm_col":         payload["norm_col"],
-        "fit_distribution": payload.get("fit_distribution", "normal"),
-    }
+def load_sequences(group: str, subject: str, ids=None) -> pd.DataFrame:
+    """clono -> CDR3_sequence, TRBV, TRBJ for one subject (confidential; load only when needed)."""
+    m = pd.read_csv(_root(group) / "sequences" / f"{subject}_sequences.csv", dtype={"clono": "int32"})
+    return m if ids is None else m[m["clono"].isin(list(ids))]
 
 def sample_qc(df, count_col='count', min_fails_to_drop=2):
     """Per-sample QC metrics, each relative to the same person's other samples.
