@@ -1,0 +1,8 @@
+person,direction,fold_change,n_reps,mean_power_unconditional,power_q025,power_q975,mean_power_conditional,mean_signal_detection_rate,mean_direction_correct_power,mean_FDP,fraction_runs_with_discovery,mean_FPR_p05_null,mean_FPR_p01_null,mean_discoveries,mean_convergence_failure_rate
+HDBR03_SEQTR_ReSeq,contraction,2.0,2,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.08890637293469708,0.0,0.0,0.0
+HDBR03_SEQTR_ReSeq,contraction,4.0,2,0.0,0.0,0.0,0.0,0.5,0.0,0.0,0.0,0.09642857142857142,0.014285714285714285,0.0,0.0
+HDBR03_SEQTR_ReSeq,contraction,10.0,2,0.0,0.0,0.0,0.0,1.0,0.0,0.0,0.0,0.05861244019138756,0.0,0.0,0.0
+HDBR03_SEQTR_ReSeq,expansion,2.0,2,0.0,0.0,0.0,0.0,0.8333333333333333,0.0,0.0,0.0,0.07965860597439545,0.0,0.0,0.0
+HDBR03_SEQTR_ReSeq,expansion,4.0,2,0.0,0.0,0.0,0.0,0.8333333333333333,0.0,0.0,0.0,0.056746031746031746,0.014285714285714285,0.0,0.0
+HDBR03_SEQTR_ReSeq,expansion,10.0,2,0.25,0.0125,0.4875,0.25,1.0,0.25,0.0,0.5,0.07023809523809524,0.014285714285714285,0.5,0.0
+HDBR03_SEQTR_ReSeq,null,1.0,2,,,,,,,0.5,0.5,0.04246031746031746,0.014285714285714285,0.5,0.0

@@ -1,0 +1,4 @@
+replicate,held_out,truth_mode,n_tested,FPR_p05,FPR_p01,BH_calls_q05,any_BH_call_q05,convergence_failure_rate
+0,HD106_SEQTR,donor,8,0.0,0.0,0,False,0.0
+0,HDBR03_SEQTR_ReSeq,donor,45,0.06666666666666667,0.022222222222222223,0,False,0.0
+0,HDBR06_SEQTR_ReSeq,donor,112,0.07142857142857142,0.026785714285714284,0,False,0.0

@@ -1858,7 +1858,7 @@ def fit_phi_trend(df: pd.DataFrame,
                   count_col: str = 'count',
                   lib_col: str = 'lib',
                   depth_col: str = 'D_t',
-                  c_col: str = 'c_t',
+                  c_val: int = 1,
                   min_detect: int = 2,
                   min_freq_mult: float = 10.0,
                   cutoff_frac: float = CUTOFF_FRAC,
@@ -1879,10 +1879,9 @@ def fit_phi_trend(df: pd.DataFrame,
     Returns dict: phi_global (one phi for all clones), bins (DataFrame: log10_freq =
     median log10 frequency of the bin, n_clones, phi, at_bound), a, b, trend.
     """
-    _require(df, ['patient', 'day', 'clono', count_col, lib_col, depth_col]
-             + ([c_col] if truncate else []))
+    _require(df, ['patient', 'day', 'clono', count_col, lib_col, depth_col])
     x, L, Dd, starts, n_per, c = _sparse_blocks(
-        df, count_col, lib_col, depth_col, min_detect, c_col if truncate else None)
+        df, count_col, lib_col, depth_col, min_detect, c_val if truncate else None)
     if len(n_per) == 0:
         raise ValueError("no clones with enough detections")
     sx = np.add.reduceat(x, starts)
