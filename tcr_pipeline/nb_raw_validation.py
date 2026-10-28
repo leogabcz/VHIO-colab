@@ -48,13 +48,13 @@ def _sample_design(g: pd.DataFrame, c_t: int = 1) -> pd.DataFrame:
         cols.append("tmm_factor")
     if "c_t" in g.columns:
         cols.append("c_t")
-    d = g[cols].groupby(["patient", "day"], as_index=False, sort=True).first()
+    d = g[cols].groupby(["patient", "day"], as_index=False, sort=True, observed=True).first()
     for col in ["D_t", "lib"] + (["tmm_factor"] if "tmm_factor" in d else []):
-        nuniq = g.groupby(["patient", "day"])[col].nunique(dropna=False)
+        nuniq = g.groupby(["patient", "day"], observed=True)[col].nunique(dropna=False)
         if (nuniq > 1).any():
             raise ValueError(f"{col} is not constant within patient/day")
     if "c_t" in d.columns:
-        nuniq = g.groupby(["patient", "day"])["c_t"].nunique(dropna=False)
+        nuniq = g.groupby(["patient", "day"], observed=True)["c_t"].nunique(dropna=False)
         if (nuniq > 1).any():
             raise ValueError("c_t column is not constant within patient/day")
         existing = pd.to_numeric(d["c_t"], errors="raise").astype(int)
@@ -134,7 +134,7 @@ def check_raw_count_data(df: pd.DataFrame, *, c_t: int = 1,
     if require_c1 and c_t != 1:
         raise ValueError("require_c1=True requires scalar c_t=1")
     d = _sample_design(df, c_t=c_t)
-    minima = (df.groupby(["patient", "day"])["count"].min()
+    minima = (df.groupby(["patient", "day"], observed=True)["count"].min()
                 .rename("min_observed_count").reset_index())
     return d.merge(minima, on=["patient", "day"], how="left")
 
@@ -150,7 +150,7 @@ def _frequency_pool(g: pd.DataFrame, c_t: int = 1) -> np.ndarray:
     total_depth = float(design["D_t"].sum())
     if total_depth <= 0:
         raise ValueError("Total depth must be positive")
-    freq = g.groupby("clono")["count"].sum().astype(float) / total_depth
+    freq = g.groupby("clono", observed=True)["count"].sum().astype(float) / total_depth
     values = freq.to_numpy(float)
     values = values[np.isfinite(values) & (values > 0)]
     if len(values) == 0:
@@ -430,7 +430,7 @@ def run_phi_trend_recovery(
 
     runs = pd.DataFrame(rows)
     ok = runs[runs["fit_status"] == "ok"].copy()
-    summary = (ok.groupby(["truth", "frequency"], as_index=False)
+    summary = (ok.groupby(["truth", "frequency"], as_index=False, observed=True)
                .agg(n_reps=("replicate", "nunique"),
                     mean_ratio=("ratio_hat_true", "mean"),
                     median_ratio=("ratio_hat_true", "median"),
@@ -445,7 +445,7 @@ def summarise_phi_recovery(runs: pd.DataFrame) -> pd.DataFrame:
     ok = runs[runs["fit_status"] == "ok"].copy()
     if ok.empty:
         return pd.DataFrame()
-    return (ok.groupby(["donor", "phi_true", "estimator"], as_index=False)
+    return (ok.groupby(["donor", "phi_true", "estimator"], as_index=False, observed=True)
               .agg(n_reps=("replicate", "nunique"),
                    mean_phi_hat=("phi_hat", "mean"),
                    median_phi_hat=("phi_hat", "median"),
@@ -543,8 +543,8 @@ def summarise_test_results(results: pd.DataFrame) -> tuple[pd.DataFrame, pd.Data
             "any_BH_call_q05": bool((g["q_value"] < .05).any()),
         })
 
-    by_person = r.groupby("held_out", dropna=False).apply(stats_for).reset_index()
-    by_miss = (r.groupby(["held_out", "n_miss"], dropna=False)
+    by_person = r.groupby("held_out", dropna=False, observed=True).apply(stats_for).reset_index()
+    by_miss = (r.groupby(["held_out", "n_miss"], dropna=False, observed=True)
                 .apply(stats_for).reset_index()) if "n_miss" in r else pd.DataFrame()
     return by_person, by_miss
 
@@ -656,7 +656,7 @@ def run_parametric_null_loo(
                     "convergence_failure_rate": float((~res["converged"].fillna(False)).mean()) if len(res) else np.nan,
                 })
                 if not res.empty:
-                    for n_miss, s in res.groupby("n_miss"):
+                    for n_miss, s in res.groupby("n_miss", observed=True):
                         pv = s.loc[s["converged"].fillna(False), "p_value"].dropna()
                         miss_rows.append({
                             "replicate": rep, "held_out": person, "truth_mode": truth_mode,
@@ -675,7 +675,7 @@ def run_parametric_null_loo(
     runs = pd.DataFrame(run_rows)
     misses = pd.DataFrame(miss_rows)
     if len(runs):
-        summary = (runs.groupby("held_out").agg(
+        summary = (runs.groupby("held_out", observed=True).agg(
             n_reps=("replicate", "nunique"), mean_FPR_p05=("FPR_p05", "mean"),
             q025_FPR_p05=("FPR_p05", lambda x: x.quantile(.025)),
             q975_FPR_p05=("FPR_p05", lambda x: x.quantile(.975)),
@@ -778,7 +778,7 @@ def run_power_simulation(
     runs = pd.DataFrame(rows)
     if runs.empty:
         return runs, pd.DataFrame()
-    summary = (runs.groupby(["person", "direction", "fold_change"], dropna=False)
+    summary = (runs.groupby(["person", "direction", "fold_change"], dropna=False, observed=True)
                .agg(n_reps=("replicate", "nunique"),
                     mean_power_unconditional=("power_unconditional_q05", "mean"),
                     power_q025=("power_unconditional_q05", lambda x: x.quantile(.025)),
