@@ -98,6 +98,67 @@ def attach_offset(df: pd.DataFrame,
     return d
 
 
+def size_factors(df: pd.DataFrame,
+                 count_col: str = 'count',
+                 depth_col: str = 'D_t',
+                 min_freq: float = 1e-5) -> pd.DataFrame:
+    """Per-sample size factors (median of ratios, as in DESeq2), within each person.
+
+    Reference clones: detected (count >= 1) in EVERY sample of the person, with mean
+    frequency (count / D_t) >= min_freq. For sample t,
+        s_t = exp( median_c [ log F_ct - mean_t' log F_ct' ] ),   F_ct = x_ct / D_t,
+    rescaled to geometric mean 1 within the person. The offset is then D_t * s_t.
+    The median over thousands of abundant shared clones is robust to a minority of
+    clones that really change; rare clones (whose counts depend strongly on depth and
+    capture) are not used.
+
+    Returns one row per (patient, day): D_t, n_ref_clones, size_factor.
+    """
+    _require(df, ['patient', 'day', 'clono', count_col, depth_col])
+    out = []
+    for p, g in df.groupby('patient', observed=True):
+        days = np.sort(g['day'].unique())
+        D = g.groupby('day', observed=True)[depth_col].first().reindex(days).to_numpy(float)
+        X = (g.pivot_table(index='clono', columns='day', values=count_col, aggfunc='sum',
+                           fill_value=0, observed=True)
+               .reindex(columns=days, fill_value=0).to_numpy(float))
+        F = X / D[None, :]
+        ref = (X >= 1).all(axis=1) & (F.mean(axis=1) >= min_freq)
+        if ref.sum() < 100:
+            warnings.warn(f"{p}: only {int(ref.sum())} reference clones for size factors")
+        if ref.sum() == 0:
+            sf = np.ones(len(days))
+        else:
+            logF = np.log(F[ref])
+            sf = np.exp(np.median(logF - logF.mean(axis=1, keepdims=True), axis=0))
+            sf = sf / np.exp(np.mean(np.log(sf)))
+        out.append(pd.DataFrame({'patient': p, 'day': days, depth_col: D,
+                                 'n_ref_clones': int(ref.sum()), 'size_factor': sf}))
+    return pd.concat(out, ignore_index=True)
+
+
+def attach_size_factor_offset(df: pd.DataFrame,
+                              count_col: str = 'count',
+                              depth_col: str = 'D_t',
+                              min_freq: float = 1e-5,
+                              out_col: str = 'lib') -> pd.DataFrame:
+    """Attach the GLM offset lib = D_t * size_factor (see ``size_factors``).
+
+    Replaces the TMM-based ``attach_offset``: on the raw (c = 1) tables TMM is driven by
+    rare clones near the detection limit and mis-normalised whole samples (up to ~30%).
+    Donors and patients must be built with the same call.
+    """
+    sf = size_factors(df, count_col=count_col, depth_col=depth_col, min_freq=min_freq)
+    key = ['patient', 'day']
+    d = df.drop(columns=['size_factor'], errors='ignore')
+    d = d.merge(sf[key + ['size_factor']].astype({'patient': df['patient'].dtype}),
+                 on=key, how='left')
+    if d['size_factor'].isna().any():
+        raise ValueError("size factor missing for some samples")
+    d[out_col] = d[depth_col].astype(float) * d['size_factor']
+    return d
+
+
 def _check_per_sample_constant(df: pd.DataFrame, cols):
     for c in cols:
         n = df.groupby(['patient', 'day'])[c].nunique()
@@ -682,10 +743,10 @@ def nb_trajectory_test(df: pd.DataFrame,
         c = per_day[cutoff_col].to_numpy(float)
         Dd = per_day[depth_col].to_numpy(float) if depth_col in g.columns else L
         wide = (g.pivot_table(index='clono', columns=time_col, values=count_col,
-                              aggfunc='sum', fill_value=0)
+                              aggfunc='sum', fill_value=0, observed=True)
                   .reindex(columns=days, fill_value=0))
         X = wide.to_numpy(float)
-        DET = X > 0
+        DET = X >= c[None, :]                         # detected = at or above the cutoff
         n_det = DET.sum(axis=1)
         keep = n_det >= min_detect
         if min_freq is not None:
@@ -836,7 +897,7 @@ def estimate_dropout_N(df: pd.DataFrame,
         trend = isinstance(phi, PhiTrend)
         phi_v = None if trend else _phi_vector(phi, patient, days, time_col)
         dcols = [lib_col] + ([depth_col] if depth_col in g.columns else [])
-        per_day = g.groupby(time_col, observed=True)[dcols].first().reindex(days)
+        per_day = g.groupby(time_col)[dcols].first().reindex(days)
         L = per_day[lib_col].to_numpy(float)
         c = np.full(len(days), float(c_val))
         Dd = per_day[depth_col].to_numpy(float) if depth_col in g.columns else L
@@ -936,7 +997,7 @@ def estimate_dropout_N(df: pd.DataFrame,
                 ok = out[(out['patient'] == pat) & ~out['flagged']]['N_t']
                 if len(ok):
                     out.at[idx, 'N_t'] = float(ok.median())
-    out['N_t_rel'] = out['N_t'] / out.groupby('patient', observed=True)['N_t'].transform('median')
+    out['N_t_rel'] = out['N_t'] / out.groupby('patient')['N_t'].transform('median')
     return out
 
 def nb_trajectory_test_censored(df: pd.DataFrame,
@@ -981,12 +1042,12 @@ def _slope_blocks(df, count_col, lib_col, depth_col, time_col, min_detect,
     cols = list(dict.fromkeys([lib_col, depth_col] + ([c_col] if c_col else [])))
     agg = {count_col: 'sum', **{col: 'first' for col in cols}}
     days_all = (df[[ 'patient', time_col]].drop_duplicates()
-                .groupby('patient', observed=True)[time_col].agg(['min', 'max', 'mean']))
+                .groupby('patient')[time_col].agg(['min', 'max', 'mean']))
     d = (df[df[count_col] > 0]
-         .groupby(['patient', 'clono', time_col], as_index=False, sort=True, observed=True).agg(agg))
-    d['n_det'] = d.groupby(['patient', 'clono'], observed=True)[time_col].transform('size')
+         .groupby(['patient', 'clono', time_col], as_index=False, sort=True).agg(agg))
+    d['n_det'] = d.groupby(['patient', 'clono'])[time_col].transform('size')
     d = d[d['n_det'] >= min_detect]
-    g = d.groupby(['patient', 'clono'], observed=True)
+    g = d.groupby(['patient', 'clono'])
     p_depth = g[count_col].transform('sum') / g[depth_col].transform('sum')
     d = d[p_depth >= min_freq_mult * cutoff_frac].reset_index(drop=True)
     if len(d) == 0:
@@ -1174,7 +1235,7 @@ def fit_phi_per_patient(df: pd.DataFrame,
     trajectory test's per-patient phi.
     """
     rows = []
-    for pat, sub in df.groupby('patient', observed=True):
+    for pat, sub in df.groupby('patient'):
         try:
             r = fit_nb_dispersion_slope(sub, log_phi_prior=log_phi_prior, **kwargs)
             r0 = fit_nb_dispersion_slope(sub, log_phi_prior=log_phi_prior,
@@ -1259,7 +1320,7 @@ def calibration_summary(res: pd.DataFrame, alpha: float = 0.05,
             'sig_contraction': int((sig & (g['beta'] < 0)).sum()),
             'separation': int((g['direction'] == 'separation').sum()),
         })
-    return res.groupby(by, observed=True).apply(_one).round(3)
+    return res.groupby(by).apply(_one).round(3)
 
 
 # =============================================================================
@@ -1297,10 +1358,10 @@ def mean_variance_decomposition(df: pd.DataFrame,
     """
     _require(df, ['patient', 'day', 'clono', count_col, depth_col, cutoff_col])
     out = []
-    for patient, g in df.groupby('patient', observed=True):
+    for patient, g in df.groupby('patient'):
         days = np.sort(g['day'].unique())
-        D = g.groupby('day', observed=True)[depth_col].first()
-        cth = g.groupby('day', observed=True)[cutoff_col].first()
+        D = g.groupby('day')[depth_col].first()
+        cth = g.groupby('day')[cutoff_col].first()
         wide = g.pivot_table(index='clono', columns='day', values=count_col,
                              aggfunc='sum', fill_value=0)
         for d1, d2 in zip(days[:-1], days[1:]):
@@ -1313,7 +1374,7 @@ def mean_variance_decomposition(df: pd.DataFrame,
             lm = np.log10(m)
             edges = np.quantile(lm, np.linspace(0, 1, n_bins + 1))
             b = np.clip(np.digitize(lm, edges[1:-1]), 0, n_bins - 1)
-            gb = (pd.DataFrame({'m': m, 'v': v, 'b': b}).groupby('b', observed=True)
+            gb = (pd.DataFrame({'m': m, 'v': v, 'b': b}).groupby('b')
                     .agg(m=('m', 'mean'), v=('v', 'mean'), n=('m', 'size')))
             gb = gb[gb['n'] >= min_per_bin]
             if len(gb) < 3:
@@ -1467,22 +1528,22 @@ def slope_profiles(df: pd.DataFrame,
     n_grid = n_grid + (1 - n_grid % 2)
     b_grid = np.linspace(-b_max, b_max, n_grid)
     out = {}
-    for patient, g in df.groupby('patient', observed=True):
+    for patient, g in df.groupby('patient'):
         days = np.sort(g[time_col].unique())
         phi_p = _phi_vector(phi, patient, days, time_col)
         span = float(np.ptp(days.astype(float)))
         if span == 0:
             continue
         dcols = [lib_col, cutoff_col] + ([depth_col] if depth_col in g.columns else [])
-        per_day = g.groupby(time_col, observed=True)[dcols].first().reindex(days)
+        per_day = g.groupby(time_col)[dcols].first().reindex(days)
         L = per_day[lib_col].to_numpy(float)
         c = per_day[cutoff_col].to_numpy(float)
         Dd = per_day[depth_col].to_numpy(float) if depth_col in g.columns else L
         wide = (g.pivot_table(index='clono', columns=time_col, values=count_col,
-                              aggfunc='sum', fill_value=0)
+                              aggfunc='sum', fill_value=0, observed=True)
                   .reindex(columns=days, fill_value=0))
         X = wide.to_numpy(float)
-        DET = X > 0
+        DET = X >= c[None, :]                         # detected = at or above the cutoff
         keep = DET.sum(1) >= min_detect
         if min_freq is not None:
             keep &= (X.sum(1) / Dd.sum()) >= min_freq
@@ -1690,11 +1751,11 @@ def _phi_sample_blocks(g, count_col, lib_col, depth_col, cutoff_col, time_col,
                        min_detect, min_freq_mult, cutoff_frac):
     days = np.sort(g[time_col].unique())
     d = g[g[count_col] > 0]
-    d = (d.groupby(['clono', time_col], as_index=False, sort=True, observed=True)
+    d = (d.groupby(['clono', time_col], as_index=False, sort=True)
            .agg({count_col: 'sum', lib_col: 'first', depth_col: 'first'}))
-    d['n_det'] = d.groupby('clono', observed=True)[time_col].transform('size')
+    d['n_det'] = d.groupby('clono')[time_col].transform('size')
     d = d[d['n_det'] >= min_detect]
-    gg = d.groupby('clono', observed=True)
+    gg = d.groupby('clono')
     f = gg[count_col].transform('sum') / gg[depth_col].transform('sum')
     d = d[f >= min_freq_mult * cutoff_frac].reset_index(drop=True)
     if len(d) == 0:
@@ -1748,7 +1809,7 @@ def fit_phi_per_sample(df: pd.DataFrame,
     """
     _require(df, ['patient', 'clono', time_col, count_col, lib_col, depth_col])
     out = []
-    for pat, g in df.groupby('patient', observed=True):
+    for pat, g in df.groupby('patient'):
         blk = _phi_sample_blocks(g, count_col, lib_col, depth_col, cutoff_col, time_col,
                                  min_detect, min_freq_mult, cutoff_frac)
         if blk is None:
@@ -1931,7 +1992,7 @@ def fit_phi_trend(df: pd.DataFrame,
 
 def fit_phi_trends(df: pd.DataFrame, **kwargs) -> dict:
     """``fit_phi_trend`` for every person in df: {patient: result dict}."""
-    return {p: fit_phi_trend(g, **kwargs) for p, g in df.groupby('patient', observed=True)}
+    return {p: fit_phi_trend(g, **kwargs) for p, g in df.groupby('patient')}
 
 
 def reference_phi_trend(trends: dict, exclude=None) -> 'PhiTrend':
