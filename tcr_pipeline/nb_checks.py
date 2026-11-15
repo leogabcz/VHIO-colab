@@ -121,7 +121,7 @@ def _bin_blocks(nb, g, kw):
         g, 'count', 'lib', 'D_t', kw['min_detect'], kw['c_val'] if kw['truncate'] else None)
     sx = np.add.reduceat(x, starts)
     p_hat = sx / np.add.reduceat(L, starts)
-    p_depth = sx / np.add.reduceat(Dd, starts)
+    p_depth = np.add.reduceat(x / Dd, starts) / n_per     # as nb.clone_frequency
     keep = p_depth >= kw['min_freq_mult'] * nb.CUTOFF_FRAC
     obs = np.repeat(keep, n_per)
     x, L = x[obs], L[obs]
@@ -175,16 +175,23 @@ def noise_by_donor(nb, d, donors, null_donors, kw=TREND_KW):
             phi, lo, hi = _profile_ci(nb, x, L, st, npb, lam0, c, kw['cox_reid'])
             rows.append(dict(donor=p, null=p in null_donors, log10_freq=lf, n_clones=n_cl,
                              phi=phi, ci_lo=lo, ci_hi=hi))
-    bins = pd.DataFrame(rows)
+    bins = pd.DataFrame(rows, columns=['donor', 'null', 'log10_freq', 'n_clones', 'phi',
+                                       'ci_lo', 'ci_hi'])
     summ = []
-    for p, b in bins.groupby('donor', sort=False):
+    for p in donors:                     # donors with fewer than 3 bins get no slope
+        b = bins[bins['donor'] == p]
+        if len(b) < 3:
+            summ.append(dict(donor=p, null=p in null_donors, phi_global=fits[p]['phi_global'],
+                             n_clones=fits[p]['n_clones'], slope_b=np.nan, slope_se=np.nan,
+                             slope_z=np.nan, line_chi2=np.nan, line_df=len(b) - 2))
+            continue
         y = np.log(b['phi'].to_numpy())
         se = (np.log(b['ci_hi']) - np.log(b['ci_lo'])).to_numpy() / 3.92
         w = 1 / np.maximum(se, 1e-3) ** 2
         X = np.column_stack([np.ones(len(b)), b['log10_freq'].to_numpy()])
         cov = np.linalg.inv(X.T @ (w[:, None] * X))
         coef = cov @ X.T @ (w * y)
-        summ.append(dict(donor=p, null=b['null'].iloc[0], phi_global=fits[p]['phi_global'],
+        summ.append(dict(donor=p, null=p in null_donors, phi_global=fits[p]['phi_global'],
                          n_clones=fits[p]['n_clones'], slope_b=coef[1],
                          slope_se=np.sqrt(cov[1, 1]), slope_z=coef[1] / np.sqrt(cov[1, 1]),
                          line_chi2=float((w * (y - X @ coef) ** 2).sum()),
@@ -397,4 +404,171 @@ def fpr_by_frequency(nb, d, res, fits, edges=(1e-5, 2e-5, 5e-5, 1e-4, 1e-3, 1.0)
             rows.append(dict(donor=short(held), bin=str(b), n=len(s), FPR_05=sig.mean(),
                              frac_expanding_sig=(s.loc[sig, 'beta'] > 0).mean(),
                              own_vs_ref=float(own(fm) / ref(fm))))
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 5. Alternative trend form: 1/phi = A/f + B
+# =============================================================================
+# Cell/molecule sampling gives relative variance ~ 1/(N f) (A/f); amplification,
+# transcripts per cell and biology give a frequency-independent part (B). Fitted by
+# weighted non-negative least squares to the per-bin phi estimates of noise_by_donor
+# (weights from their 95% profile intervals); same number of parameters as the line.
+
+def fit_phi_AfB(nb, bins_donor, n_grid=80):
+    from scipy.optimize import nnls
+    b = bins_donor
+    f = 10.0 ** b['log10_freq'].to_numpy()
+    y = 1.0 / b['phi'].to_numpy()
+    se_log = (np.log(b['ci_hi']) - np.log(b['ci_lo'])).to_numpy() / 3.92
+    sd = np.maximum(se_log, 1e-3) * y                  # sd of 1/phi (delta method)
+    Xd = np.column_stack([1.0 / f, np.ones_like(f)])
+    w = 1.0 / sd
+    (A, B), _ = nnls(Xd * w[:, None], y * w)
+    resid = (y - Xd @ np.array([A, B])) / sd
+    lo, hi = b['log10_freq'].min(), b['log10_freq'].max()
+    grid = np.linspace(lo, hi, n_grid)
+    phi_grid = 1.0 / np.maximum(A / 10.0 ** grid + B, 1e-12)
+    return dict(A=A, B=B, chi2=float((resid ** 2).sum()), df=len(b) - 2,
+                trend=nb.PhiTrend(grid, phi_grid))
+
+
+def trend_forms(nb, summary, bins):
+    """Line (log phi vs log10 f) vs A/f + B, per donor: lack of fit (chi2 on df)."""
+    rows = []
+    for p, b in bins.groupby('donor', sort=False):
+        afb = fit_phi_AfB(nb, b)
+        s = summary[summary['donor'] == p].iloc[0]
+        rows.append(dict(donor=short(p), line_chi2=s['line_chi2'], AfB_chi2=afb['chi2'],
+                         df=afb['df'], A=afb['A'], B=afb['B'],
+                         phi_plateau=1 / afb['B'] if afb['B'] > 0 else np.inf))
+    return pd.DataFrame(rows)
+
+
+def trend_recovery_simulation(nb, truths: dict, n_clones=150_000, days=(0, 30, 60, 90),
+                              depths=(8e6, 1.0e7, 1.2e7, 9e6), seed=0, kw=TREND_KW):
+    """Simulate donors with known phi(f) (dict name -> callable), fit the per-bin trend,
+    the line and A/f + B, and report fitted / true phi on a frequency grid."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for name, truth in truths.items():
+        D = np.asarray(depths, float)
+        f = np.minimum(3e-7 * (1 + rng.pareto(1.0, n_clones)), 1e-2)
+        ph = truth(f)[:, None]
+        mu = f[:, None] * D[None, :]
+        x = rng.negative_binomial(ph, ph / (ph + mu))
+        ci, ti = np.nonzero(x >= 1)
+        g = pd.DataFrame({'patient': name, 'day': np.asarray(days)[ti], 'clono': ci,
+                          'count': x[ci, ti], 'D_t': D[ti], 'lib': D[ti]})
+        g['patient'] = g['patient'].astype('category')
+        summ, bins, fits = noise_by_donor(nb, g, [name], [name], kw=kw)
+        afb = fit_phi_AfB(nb, bins)
+        grid = np.linspace(bins['log10_freq'].min(), bins['log10_freq'].max(), 5)
+        for lf in grid:
+            fq = 10.0 ** lf
+            rows.append(dict(truth=name, log10_freq=lf, true_phi=float(truth(np.array([fq]))[0]),
+                             line=float(fits[name]['trend'](fq)), AfB=float(afb['trend'](fq))))
+    out = pd.DataFrame(rows)
+    out['line_vs_true'] = out['line'] / out['true_phi']
+    out['AfB_vs_true'] = out['AfB'] / out['true_phi']
+    return out
+
+
+# =============================================================================
+# 6. Power
+# =============================================================================
+# Neutral data on a real donor's design (days, depths, offsets, clone frequencies, its
+# own phi trend), with known trajectories planted in a fraction of the clones above the
+# floor; tested exactly like a patient (reference = minimum of the OTHER null donors).
+
+PATTERNS = {   # name -> function(fold, s, n_samples) giving the multiplier per sample
+    'expansion':        lambda F, s, T: F ** s,
+    'contraction':      lambda F, s, T: F ** (-s),
+    'transient':        lambda F, s, T: np.where(np.arange(T) == T // 2, F, 1.0),
+}
+FOLDS = (2, 4, 10)
+TO_ZERO = 100          # contraction to (near) absence: last sample at 1% of the start
+
+
+def _plant(f, days, rng, share):
+    s = (days - days[0]) / max(days[-1] - days[0], 1)
+    T = len(days)
+    mult = np.ones((len(f), T))
+    labels = np.array([''] * len(f), dtype=object)
+    eligible = np.flatnonzero(f >= FLOOR)
+    combos = [(p, F) for p in PATTERNS for F in FOLDS] + [('contraction_to_zero', TO_ZERO)]
+    pick = rng.permutation(eligible)
+    n_each = max(int(share * len(eligible)), 1)
+    for i, (p, F) in enumerate(combos):
+        idx = pick[i * n_each:(i + 1) * n_each]
+        fn = PATTERNS['contraction'] if p == 'contraction_to_zero' else PATTERNS[p]
+        mult[idx] = fn(F, s, T)[None, :]
+        labels[idx] = f'{p} x{F}'
+    return mult, labels
+
+
+def power_simulation(nb, d, fits, donors, share=0.02, designs=('slope', 'quadratic'),
+                     k=K_LOW, seed=0, verbose=True):
+    """Per donor design: plant every pattern x fold in `share` of the clones above the
+    floor (each), test with the reference from the other donors. Returns (per-clone
+    results with the planted label, '' = null; planted totals per donor and pattern,
+    including clones that never became testable)."""
+    out, totals = [], []
+    for i, p in enumerate(donors):
+        g = subset(d, p)
+        rng = np.random.default_rng(seed + i)
+        days = np.sort(g['day'].unique())
+        per_day = g.groupby('day', observed=True)[['D_t', 'lib']].first().reindex(days)
+        D, lib = per_day['D_t'].to_numpy(float), per_day['lib'].to_numpy(float)
+        X = (g.pivot_table(index='clono', columns='day', values='count', aggfunc='sum',
+                           fill_value=0, observed=True).reindex(columns=days, fill_value=0)
+               .to_numpy(float))
+        f = nb.clone_frequency(X, X >= 1, D)
+        f = f[np.isfinite(f) & (f >= FLOOR / 10)]
+        mult, labels = _plant(f, days.astype(float), rng, share)
+        ph = fits[p]['trend'](f)[:, None]
+        mu = f[:, None] * lib[None, :] * mult
+        x = rng.negative_binomial(ph, ph / (ph + mu))
+        ci, ti = np.nonzero(x >= 1)
+        sim = pd.DataFrame({'patient': str(p), 'day': days[ti], 'clono': ci,
+                            'count': x[ci, ti], 'D_t': D[ti]})
+        sim['patient'] = sim['patient'].astype('category')
+        sim = nb.attach_size_factor_offset(sim)
+        ref = reference_trend(nb, fits, exclude=p)
+        lab = pd.Series(labels, index=np.arange(len(f)).astype(str))
+        for des in designs:
+            g2 = sim.assign(c_t=int(k))
+            r = nb.nb_trajectory_test(g2, ref, likelihood='truncated', cutoff_col='c_t',
+                                      min_freq=FLOOR, design=des)
+            r = nb.add_qvalues(r, p_col='p_value', by='patient')
+            r['planted'] = r['clono'].astype(str).map(lab).fillna('')
+            out.append(r.assign(donor=short(p), design=des))
+            if verbose:
+                print(f'{short(p):7s} {des:9s}: {len(r):,} clones tested')
+        tot = pd.Series(labels[labels != '']).value_counts()
+        totals.append(pd.DataFrame({'donor': short(p), 'pattern': tot.index,
+                                    'n_planted': tot.to_numpy()}))
+    return pd.concat(out, ignore_index=True), pd.concat(totals, ignore_index=True)
+
+
+def power_summary(res, totals, alpha=ALPHA):
+    """Per donor x design x planted pattern: share of planted clones that were testable,
+    power among testable (p < alpha), detection at FDR 5% among ALL planted, and the
+    false share among FDR-5% calls."""
+    rows = []
+    for (dn, des), r in res.groupby(['donor', 'design']):
+        bh = r['q_value'] < alpha
+        null = r['planted'] == ''
+        rows.append(dict(donor=dn, design=des, pattern='(null clones)', n_planted=int(null.sum()),
+                         testable=1.0, power_p05=(r.loc[null, 'p_value'] < alpha).mean(),
+                         detected_FDR5=bh[null].mean(),
+                         false_share_of_calls=(bh & null).sum() / max(bh.sum(), 1)))
+        tot = totals[totals['donor'] == dn]
+        for pat, n_tot in zip(tot['pattern'], tot['n_planted']):
+            rr = r[r['planted'] == pat]
+            rows.append(dict(donor=dn, design=des, pattern=pat, n_planted=int(n_tot),
+                             testable=len(rr) / n_tot,
+                             power_p05=(rr['p_value'] < alpha).mean() if len(rr) else np.nan,
+                             detected_FDR5=(rr['q_value'] < alpha).sum() / n_tot,
+                             false_share_of_calls=np.nan))
     return pd.DataFrame(rows)

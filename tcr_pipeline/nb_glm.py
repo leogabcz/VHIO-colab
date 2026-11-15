@@ -407,7 +407,9 @@ def fit_nb_dispersion_cr(df: pd.DataFrame,
 
     sx = np.add.reduceat(x, starts)
     p_hat = sx / np.add.reduceat(L, starts)          # warm start, offset scale
-    p_depth = sx / np.add.reduceat(Dd, starts)       # frequency relative to true depth
+    # frequency relative to true depth: unweighted mean over detected samples
+    # (same definition as clone_frequency, used for the phi lookup in the test)
+    p_depth = np.add.reduceat(x / Dd, starts) / n_per
     keep = p_depth >= min_freq_mult * cutoff_frac
     if not keep.any():
         raise ValueError("no clones above min_freq_mult * cutoff")
@@ -708,8 +710,9 @@ def nb_trajectory_test(df: pd.DataFrame,
         (patient, time_col, N_t).
     min_freq : independent abundance filter (as edgeR's filterByExpr): test only clones
         whose average frequency over the person's sampled days,
-        sum_t count / sum_t D_t (misses counted as 0), is >= min_freq. The filter
-        uses overall abundance, not the trajectory, so it does not bias the test; it
+        mean_t (count / D_t) (misses counted as 0), is >= min_freq. Every sample is
+        weighted equally: a depth-weighted pooled frequency would favour clones that
+        happen to be high in the deepest sample and bias their slopes towards it. It
         removes clones with essentially no power, which lightens the BH correction
         for the rest. None = no filter. depth_col (D_t) is used for the frequency.
     n_jobs : parallel workers via joblib (1 = sequential).
@@ -749,8 +752,8 @@ def nb_trajectory_test(df: pd.DataFrame,
         DET = X >= c[None, :]                         # detected = at or above the cutoff
         n_det = DET.sum(axis=1)
         keep = n_det >= min_detect
-        if min_freq is not None:
-            keep &= (X.sum(axis=1) / Dd.sum()) >= min_freq
+        if min_freq is not None:                      # unweighted mean frequency
+            keep &= (X / Dd[None, :]).mean(axis=1) >= min_freq
         sel = np.flatnonzero(keep)
         if len(sel) == 0:
             continue
@@ -1545,8 +1548,8 @@ def slope_profiles(df: pd.DataFrame,
         X = wide.to_numpy(float)
         DET = X >= c[None, :]                         # detected = at or above the cutoff
         keep = DET.sum(1) >= min_detect
-        if min_freq is not None:
-            keep &= (X.sum(1) / Dd.sum()) >= min_freq
+        if min_freq is not None:                      # unweighted mean frequency
+            keep &= (X / Dd[None, :]).mean(axis=1) >= min_freq
         if not keep.any():
             continue
         N = None
@@ -1905,14 +1908,18 @@ class PhiTrend:
 
 
 def clone_frequency(X: np.ndarray, DET: np.ndarray, D: np.ndarray) -> np.ndarray:
-    """Clone frequency over its DETECTED samples: sum_t x_ct / sum_t D_t (t detected).
+    """Clone frequency over its DETECTED samples: mean_t (x_ct / D_t), t detected,
+    every sample weighted equally.
 
-    The same definition as the frequency used to bin clones in ``fit_phi_trend``.
+    The same definition as the frequency used to bin clones and apply the floor in
+    ``fit_phi_trend`` / ``fit_nb_dispersion_cr``. Not depth-weighted on purpose: a
+    pooled sum_t x / sum_t D is dominated by the deepest sample, so clones that happen
+    to be high there would get a higher phi (less noise) and their slopes would lean
+    towards that sample (a selection effect; cf. Bourgon et al. 2010).
     X, DET: clones x samples; D: depth per sample.
     """
-    num = np.where(DET, X, 0.0).sum(axis=1)
-    den = (DET * np.asarray(D, float)[None, :]).sum(axis=1)
-    return num / np.maximum(den, 1e-300)
+    F = np.where(DET, X / np.asarray(D, float)[None, :], 0.0)
+    return F.sum(axis=1) / np.maximum(DET.sum(axis=1), 1)
 
 
 def fit_phi_trend(df: pd.DataFrame,
@@ -1947,7 +1954,7 @@ def fit_phi_trend(df: pd.DataFrame,
         raise ValueError("no clones with enough detections")
     sx = np.add.reduceat(x, starts)
     p_hat = sx / np.add.reduceat(L, starts)
-    p_depth = sx / np.add.reduceat(Dd, starts)
+    p_depth = np.add.reduceat(x / Dd, starts) / n_per   # as clone_frequency
     keep = p_depth >= min_freq_mult * cutoff_frac
     obs = np.repeat(keep, n_per)
     x, L = x[obs], L[obs]
