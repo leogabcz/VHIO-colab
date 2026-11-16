@@ -1,8 +1,0 @@
-sample,verdict,why
-BR032 d0,Swapped,shares 1% with BR032's other samples (usual 62%) but 27% with BR037's samples (usual within BR037: 22%); its counterpart BR037 d28 comes from BR032: the two samples were swapped
-BR037 d28,Swapped,shares 0% with BR037's other samples (usual 22%) but 73% with BR032's samples (usual within BR032: 62%); its counterpart BR032 d0 comes from BR037: the two samples were swapped
-BR052 d0,Contains material from another sample,"matches BR052 normally (58%), but 99% of the largest clonotypes of BR032 d0 (= BR037's sample) are also present here (different people: below 8%); 11.7 M reads (usual 5.6 M)"
-BR052 d164,Failed library,"shares 6% of its largest clonotypes with BR052's other samples (usual 56%); 17,836 clonotypes (5% of usual), top-500 hold 83% of reads (usual 13%)"
-BR052 d192,Failed library,"shares 6% of its largest clonotypes with BR052's other samples (usual 56%); 36,788 clonotypes (9% of usual), top-500 hold 68% of reads (usual 13%)"
-BR054 d141,Failed library,"shares 0% of its largest clonotypes with BR054's other samples (usual 72%); 103,473 clonotypes (26% of usual), top-500 hold 72% of reads (usual 21%)"
-BR054 d19,Contains material from another sample,"matches BR054 normally (66%), but 99% of the largest clonotypes of BR037 d28 (= BR032's sample) are also present here (different people: below 8%); 11.7 M reads (usual 5.4 M)"
